@@ -12,6 +12,37 @@ use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Antimalware::*;
 
+pub fn quick_scan_folders() -> Vec<std::path::PathBuf> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_Desktop, FOLDERID_Downloads, SHGetKnownFolderPath,
+    };
+
+    [FOLDERID_Downloads, FOLDERID_Desktop]
+        .into_iter()
+        .filter_map(|id| {
+            let mut raw = ptr::null_mut();
+            // The shell allocates a null-terminated path, which must be freed even on failure.
+            let status = unsafe { SHGetKnownFolderPath(&id, 0, ptr::null_mut(), &mut raw) };
+            if raw.is_null() {
+                return None;
+            }
+            let path = if status >= 0 {
+                let length = (0..)
+                    .take_while(|index| unsafe { *raw.add(*index) != 0 })
+                    .count();
+                let wide = unsafe { std::slice::from_raw_parts(raw, length) };
+                Some(std::path::PathBuf::from(OsString::from_wide(wide)))
+            } else {
+                None
+            };
+            unsafe { CoTaskMemFree(raw.cast()) };
+            path
+        })
+        .collect()
+}
+
 fn wide(text: &OsStr) -> Vec<u16> {
     text.encode_wide().chain(Some(0)).collect()
 }

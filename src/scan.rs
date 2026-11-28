@@ -1,13 +1,12 @@
 use crate::windows::{Amsi, regular_file};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::os::windows::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::System::Antimalware::{
@@ -86,7 +85,7 @@ fn document_named_pe(path: &Path, bytes: &[u8]) -> bool {
         && matches!(u16::from_le_bytes([header[24], header[25]]), 0x10b | 0x20b)
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Verdict {
     pub sha256: String,
     pub findings: Vec<Finding>,
@@ -192,28 +191,88 @@ impl Engine {
     }
 }
 
-pub fn tree(engine: &Engine, root: &Path) -> Result<u8> {
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct Summary {
+    pub files_scanned: u64,
+    pub files_with_findings: u64,
+    pub incomplete: u64,
+    pub cancelled: bool,
+}
+
+impl Summary {
+    pub fn exit_code(&self) -> u8 {
+        if self.incomplete > 0 || self.cancelled {
+            2
+        } else if self.files_with_findings > 0 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ScanEvent {
+    File {
+        path: PathBuf,
+        verdict: Verdict,
+    },
+    Unscanned {
+        path: Option<PathBuf>,
+        reason: String,
+    },
+}
+
+pub fn tree(
+    engine: &Engine,
+    root: &Path,
+    cancelled: impl Fn() -> bool,
+    emit: impl FnMut(ScanEvent) -> Result<()>,
+) -> Result<Summary> {
+    tree_excluding(engine, root, None, cancelled, emit)
+}
+
+pub fn tree_excluding(
+    engine: &Engine,
+    root: &Path,
+    exclude: Option<&Path>,
+    cancelled: impl Fn() -> bool,
+    mut emit: impl FnMut(ScanEvent) -> Result<()>,
+) -> Result<Summary> {
     let root = crate::windows::disk_path(root)?;
-    let mut scanned = 0u64;
-    let mut matches = 0u64;
-    let mut incomplete = 0u64;
+    let mut summary = Summary::default();
     let mut iter = WalkDir::new(&root)
         .follow_links(false)
         .follow_root_links(false)
         .sort_by_file_name()
         .into_iter();
     while let Some(entry) = iter.next() {
+        if cancelled() {
+            summary.cancelled = true;
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                incomplete += 1;
-                crate::emit(
-                    json!({"event":"unscanned","path":error.path().map(|p| p.to_string_lossy()),"reason":error.to_string()}),
-                )?;
+                summary.incomplete += 1;
+                emit(ScanEvent::Unscanned {
+                    path: error.path().map(Path::to_owned),
+                    reason: error.to_string(),
+                })?;
                 continue;
             }
         };
         let path = entry.path();
+        if exclude.is_some_and(|folder| {
+            path.ancestors()
+                .any(|part| part.as_os_str().eq_ignore_ascii_case(folder.as_os_str()))
+        }) {
+            if entry.file_type().is_dir() {
+                iter.skip_current_dir();
+            }
+            continue;
+        }
         let result: Result<Option<Verdict>> = (|| {
             let metadata = std::fs::symlink_metadata(path)?;
             if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -230,30 +289,23 @@ pub fn tree(engine: &Engine, root: &Path) -> Result<u8> {
         })();
         match result {
             Ok(Some(verdict)) => {
-                scanned += 1;
-                matches += u64::from(!verdict.findings.is_empty());
-                incomplete += u64::from(verdict.provider_error.is_some());
-                crate::emit(
-                    json!({"event":"file","path":path.to_string_lossy(),"verdict":verdict}),
-                )?;
+                summary.files_scanned += 1;
+                summary.files_with_findings += u64::from(!verdict.findings.is_empty());
+                summary.incomplete += u64::from(verdict.provider_error.is_some());
+                emit(ScanEvent::File {
+                    path: path.to_owned(),
+                    verdict,
+                })?;
             }
             Ok(None) => (),
             Err(error) => {
-                incomplete += 1;
-                crate::emit(
-                    json!({"event":"unscanned","path":path.to_string_lossy(),"reason":error.to_string()}),
-                )?;
+                summary.incomplete += 1;
+                emit(ScanEvent::Unscanned {
+                    path: Some(path.to_owned()),
+                    reason: error.to_string(),
+                })?;
             }
         }
     }
-    crate::emit(
-        json!({"event":"summary","files_scanned":scanned,"files_with_findings":matches,"incomplete":incomplete}),
-    )?;
-    Ok(if incomplete > 0 {
-        2
-    } else if matches > 0 {
-        1
-    } else {
-        0
-    })
+    Ok(summary)
 }

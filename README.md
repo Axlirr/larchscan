@@ -1,46 +1,71 @@
-![LarchScan wordmark beside a cross-section of a larch tree](docs/images/larchscan-banner.jpg)
+<div align="center">
+
+<img src="docs/images/larchscan-icon.png" width="76" height="76" alt="LarchScan tree-ring icon">
 
 # LarchScan
 
-**LarchScan is a Windows command-line tool for checking suspicious files.** Choose a file or folder, see why each file was flagged, and decide what to quarantine. It runs on demand and is written in Rust.
+### Inspect files, understand findings, and manage quarantine on Windows.
 
-**[Download the Windows x64 preview](https://github.com/Axlirr/larchscan/releases/download/v0.1.0/larchscan-0.1.0-windows-x64.zip)** · [Release notes and checksums](https://github.com/Axlirr/larchscan/releases/tag/v0.1.0) · [CLI guide](docs/cli-guide.md)
+An open-source desktop scanner with file and folder scans, reviewable findings, and reversible quarantine. Built in Rust.
 
-## Try your first scan
+[![Windows x64](https://img.shields.io/badge/Windows-x64-254c3a?style=flat-square)](https://github.com/Axlirr/larchscan/releases/tag/v0.2.0)
+[![Release v0.2.0](https://img.shields.io/badge/Release-v0.2.0-b8d999?style=flat-square)](https://github.com/Axlirr/larchscan/releases/tag/v0.2.0)
+[![MIT License](https://img.shields.io/badge/License-MIT-d8a750?style=flat-square)](LICENSE)
 
-Extract the Windows ZIP, open PowerShell in the extracted folder, and scan the harmless sample included with the download.
+**[Download for Windows](https://github.com/Axlirr/larchscan/releases/download/v0.2.0/larchscan-0.2.0-windows-x64.zip)** · [Quick start](#quick-start) · [Screenshots](#screenshots) · [Documentation](#documentation) · [Issues](https://github.com/Axlirr/larchscan/issues)
+
+</div>
+
+## Overview
+
+Choose a file, a folder, or the Windows system drive. LarchScan checks what it can read and shows the reason for each finding, including suspicious filenames, matching file fingerprints, and optional Windows antimalware verdicts. Review the evidence before quarantining a file, or export a report to keep a record.
+
+![LarchScan desktop dashboard with quick scan and file, folder, and system-drive scan options](docs/images/desktop-overview.png)
+
+## What's new in v0.2.0
+
+| Feature | What you can do |
+| --- | --- |
+| **Desktop scanning** | Run a quick scan of Downloads and Desktop, choose a file or folder, or scan the system drive. Follow progress and stop a scan with a partial report. |
+| **Findings and quarantine** | Review rule explanations and SHA-256 fingerprints, archive a file after confirmation, and restore its verified contents to a new location. |
+| **Scan history** | Reopen recent reports and export findings, skipped files, and scan totals as JSON. |
+| **Custom checks** | Load a JSON list of SHA-256 fingerprints or opt in to verdicts from your installed Windows antimalware provider through AMSI. |
+| **Scheduled quick scans** | Set an interval for Downloads and Desktop scans while the app is open. |
+
+## Screenshots
+
+<details>
+<summary>Inside the app</summary>
+<table>
+<tr>
+<td width="50%"><img src="docs/images/desktop-results.png" alt="Scan results with file counts, a rule explanation and a quarantine action"><br><strong>Scan results</strong></td>
+<td width="50%"><img src="docs/images/desktop-settings.png" alt="Desktop app settings for AMSI, scheduled scans, and custom rules"><br><strong>Scanner settings</strong></td>
+</tr>
+</table>
+</details>
+
+## Quick start
+
+1. Download and extract the **Windows x64 ZIP**. [Get the release](https://github.com/Axlirr/larchscan/releases/tag/v0.2.0)
+2. Open **LarchScan.exe**.
+3. Select **Start quick scan**, or choose a file or folder. To verify the workflow, select the bundled `examples/demo.txt` file. The expected finding is `demo.fixture`.
+
+The portable executable is unsigned. It requires Microsoft Edge WebView2 Runtime. [Microsoft WebView2 download](https://developer.microsoft.com/microsoft-edge/webview2/)
+
+## Documentation
+
+- [Desktop guide](docs/desktop-guide.md) covers scan options, reports, recovery, and current limits.
+- [CLI guide](docs/cli-guide.md) covers the command-line executable included under `tools/`.
+- [Research notes](RESEARCH.md) describe the initial release-artifact research and test scope.
+
+### Build from source
+
+On Windows x64, use the Rust MSVC toolchain, Visual Studio C++ Build Tools, and a Windows SDK.
 
 ```powershell
-.\larchscan.exe scan .\examples\demo.txt
+cargo build --locked --release --features desktop --bins
+cargo run --locked --features desktop --bin larchscan-desktop
+cargo test --locked --features desktop
 ```
 
-Look for `demo.fixture`. That rule recognizes the sample by its SHA-256 fingerprint. The summary should show one file scanned, one file with a finding, and zero incomplete checks. Exit code `1` means a rule matched.
-
-![PowerShell transcript from LarchScan 0.1.0 showing the demo.fixture finding, its reason, and a summary of one file scanned](docs/images/powershell-scan.png)
-
-*Output from the released CLI. The PowerShell commands shown above format its JSON output for reading.*
-
-## What can it catch?
-
-A file called `invoice.pdf.exe` might look like a document at a glance. LarchScan checks the filename alongside the file's Windows executable headers and flags that combination for review. A filename mismatch alone does not establish that a file is malware.
-
-You can also supply a list of known file fingerprints with `--rules`, or use `--amsi` to request a verdict from the antimalware provider installed on your Windows machine. Each result includes the file's fingerprint and the reason for any finding. Skipped files appear in the report.
-
-## What happens when I quarantine a file?
-
-1. **Review the finding.** Copy the SHA-256 fingerprint from the scan.
-2. **Quarantine the matching file.** LarchScan checks the fingerprint again, saves a recovery copy, and verifies it before removing the original.
-3. **Restore if needed.** Choose a new destination. LarchScan verifies the archived contents and keeps the recovery copy.
-
-The preview supports local NTFS files up to 32 MiB. Files with extra data streams, including some downloaded files, can be scanned but are excluded from quarantine. The guide includes a full quarantine-and-restore example and explains how to store the vault. [Read the CLI guide](docs/cli-guide.md)
-
-## Development
-
-Build on Windows x64 with Rust, the Visual Studio C++ build tools, and a Windows SDK.
-
-```powershell
-cargo build --locked --release
-cargo test --locked --release
-```
-
-Eight integration tests cover scanning and recovery with harmless files, including changed files, damaged archives, and restore collisions. The project is available under the MIT license. [Research and test scope](RESEARCH.md) · [License](LICENSE)
+LarchScan provides on-demand and scheduled file scans. The current release has no real-time blocking or maintained signature feed. [License](LICENSE)

@@ -3,7 +3,6 @@ use crate::windows::{disk_path, regular_file, remove_on_close};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::fs::MetadataExt;
@@ -16,13 +15,13 @@ const HEADER_LIMIT: u64 = 128 * 1024;
 const ENCODED_LIMIT: usize = MAX_BYTES.div_ceil(3) * 4;
 
 #[derive(Debug, Deserialize, Serialize)]
-struct Receipt {
+pub struct Receipt {
     format: String,
-    id: Uuid,
-    original: PathBuf,
-    sha256: String,
-    bytes: usize,
-    findings: Vec<Finding>,
+    pub id: Uuid,
+    pub original: PathBuf,
+    pub sha256: String,
+    pub bytes: usize,
+    pub findings: Vec<Finding>,
 }
 
 fn item_path(dir: &Path, id: Uuid) -> PathBuf {
@@ -81,7 +80,7 @@ fn unpack(path: &Path, expected: Uuid) -> Result<(Receipt, Vec<u8>)> {
     Ok((receipt, bytes))
 }
 
-pub fn quarantine(dir: &Path, path: &Path, expected: &str, engine: &Engine) -> Result<()> {
+pub fn quarantine(dir: &Path, path: &Path, expected: &str, engine: &Engine) -> Result<Receipt> {
     let path = disk_path(path)?;
     check_directories(path.parent().context("file needs a parent")?)?;
     check_directories(dir)?;
@@ -139,16 +138,17 @@ pub fn quarantine(dir: &Path, path: &Path, expected: &str, engine: &Engine) -> R
     remove_on_close(&file)
         .with_context(|| format!("archive {id} saved; original removal failed"))?;
     drop(file);
-    crate::emit(json!({"event":"quarantined","receipt":receipt}))
+    Ok(receipt)
 }
 
-pub fn list(dir: &Path) -> Result<()> {
+pub fn list(dir: &Path) -> Result<Vec<Receipt>> {
     check_directories(dir)?;
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
+    let mut receipts = Vec::new();
     for entry in entries {
         let path = entry?.path();
         if path.extension().is_some_and(|extension| extension == "lsq") {
@@ -158,13 +158,13 @@ pub fn list(dir: &Path) -> Result<()> {
                     .context("invalid archive name")?,
             )?;
             let receipt = header(&mut BufReader::new(regular_file(&path, false)?), id)?;
-            crate::emit(json!({"event":"archived","receipt":receipt}))?;
+            receipts.push(receipt);
         }
     }
-    Ok(())
+    Ok(receipts)
 }
 
-pub fn restore(dir: &Path, id: Uuid, dest: &Path) -> Result<()> {
+pub fn restore(dir: &Path, id: Uuid, dest: &Path) -> Result<String> {
     check_directories(dir)?;
     let dest = disk_path(dest)?;
     let parent = dest
@@ -191,5 +191,5 @@ pub fn restore(dir: &Path, id: Uuid, dest: &Path) -> Result<()> {
             .persist_noclobber(&dest)
             .context("restore requires a new destination file")?,
     );
-    crate::emit(json!({"event":"restored","id":id,"to":dest,"sha256":receipt.sha256}))
+    Ok(receipt.sha256)
 }

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>LarchScan</title>
+  <style>/* APP_CSS */</style>
+</head>
+<body>
+  <aside class="rail">
+    <div class="brand"><img src="data:image/png;base64,APP_ICON_BASE64" alt=""><div><strong>LarchScan</strong><small>Windows security tools</small></div></div>
+    <nav aria-label="Workspace">
+      <button data-page="overview" aria-current="page"><span class="nav-icon i-overview" aria-hidden="true"></span>Overview</button>
+      <button data-page="scans"><span class="nav-icon i-scan" aria-hidden="true"></span>Scan results</button>
+      <button data-page="vault"><span class="nav-icon i-vault" aria-hidden="true"></span>Quarantine</button>
+      <button data-page="history"><span class="nav-icon i-history" aria-hidden="true"></span>Scan history</button>
+      <button data-page="settings"><span class="nav-icon i-settings" aria-hidden="true"></span>Settings</button>
+    </nav>
+    <div class="rail-footer"><span></span> Local workspace</div>
+  </aside>
+  <main id="workspace">
+    <header class="topbar"><span id="section-label">Overview</span><span class="mode" id="mode"><i></i> On-demand scanner</span></header>
+    <div id="toast" role="status" hidden></div>
+    <section id="overview" class="page">
+      <div class="hero">
+        <img class="hero-mark" src="data:image/png;base64,APP_ICON_BASE64" alt="">
+        <div class="hero-copy"><p class="eyebrow">FILE SECURITY</p><h1>Inspect your files</h1>
+        <p>Check a file or folder for known fingerprints and suspicious filenames. Review each finding before you quarantine anything.</p>
+        <button class="primary scan-action" data-action="quick">Start quick scan <span aria-hidden="true">→</span></button></div>
+      </div>
+      <div class="section-head"><h2>Scan options</h2><span id="scan-options-note">Choose what to inspect</span></div>
+      <div class="scan-grid">
+        <article class="card scan-card"><span class="tile-icon i-file" aria-hidden="true"></span><h3>Single file</h3><p>Check a specific download or document.</p><button class="secondary scan-action" data-action="pick_file">Choose file</button></article>
+        <article class="card scan-card"><span class="tile-icon i-folder" aria-hidden="true"></span><h3>Folder scan</h3><p>Inspect files in a folder and its subfolders.</p><button class="secondary scan-action" data-action="pick_folder">Choose folder</button></article>
+        <article class="card scan-card"><span class="tile-icon i-drive" aria-hidden="true"></span><h3>System drive</h3><p>Scan accessible files on the Windows drive.</p><button class="secondary scan-action" data-action="deep">Scan system drive</button></article>
+      </div>
+      <div class="section-head"><h2>Recent activity</h2><button class="text-button" data-page="history">View history <span aria-hidden="true">→</span></button></div>
+      <div id="recent" class="card"></div>
+    </section>
+    <section id="scans" class="page" hidden>
+      <div class="page-title"><h1>Scan results</h1><p id="result-subtitle">Review findings and files that could not be checked.</p></div>
+      <div id="progress" class="card progress-card" hidden><div class="row-between"><strong id="scan-scope">Scanning</strong><button class="secondary" id="cancel" data-action="cancel">Stop scan</button></div><progress aria-label="File scan in progress"></progress><p id="current-file"></p></div>
+      <div class="stat-grid"><div class="card stat"><span>Files scanned</span><strong id="count-files">0</strong></div><div class="card stat"><span>With findings</span><strong id="count-findings">0</strong></div><div class="card stat"><span>Incomplete checks</span><strong id="count-incomplete">0</strong></div></div>
+      <div class="section-head"><div class="tabs"><button class="selected" data-tab="findings">Findings</button><button data-tab="skipped">Skipped and incomplete</button></div><button class="secondary" id="export" hidden>Export report</button></div>
+      <div id="findings" class="card"></div><div id="skipped" class="card" hidden></div>
+    </section>
+    <section id="vault" class="page" hidden>
+      <div class="page-title"><h1>Quarantine</h1><p>Review archived files and restore their verified contents to a new location.</p></div>
+      <div class="section-head"><h2>Archived files</h2><button class="secondary" data-action="vault">Refresh</button></div>
+      <div id="archives" class="card"><p class="empty">Reading the quarantine vault…</p></div>
+    </section>
+    <section id="history" class="page" hidden>
+      <div class="page-title"><h1>Scan history</h1><p>Open a saved report to review scan results or export them as JSON.</p></div>
+      <div id="history-rows" class="card"></div>
+    </section>
+    <section id="settings" class="page" hidden>
+      <div class="page-title"><h1>Settings</h1><p>Control how LarchScan runs checks on this PC.</p></div>
+      <div class="card settings">
+        <div class="setting"><div><h3>Windows antimalware provider</h3><p>Submit file contents to the installed provider through AMSI. Its privacy and network settings apply.</p></div><label class="switch"><input id="amsi" type="checkbox" aria-label="Enable Windows antimalware provider"><span></span></label></div>
+        <div class="setting"><div><h3>Scheduled quick scan</h3><p>Scan Downloads and Desktop at an interval while LarchScan stays open.</p></div><select id="schedule" aria-label="Scheduled quick scan interval"><option value="0">Off</option><option value="30">Every 30 minutes</option><option value="60">Every hour</option><option value="240">Every 4 hours</option><option value="1440">Every 24 hours</option></select></div>
+        <div class="setting"><div><h3>Custom fingerprint rules</h3><p id="rule-file">No custom rule file selected.</p></div><div class="actions"><button class="secondary" id="clear-rules" data-action="clear_rules" hidden>Remove</button><button class="secondary" data-action="pick_rules">Choose JSON</button></div></div>
+      </div>
+      <p class="footnote">Rules, reports and quarantine records are stored locally. Scans cover local files up to 32 MiB.</p>
+    </section>
+  </main>
+  <script>/* APP_JS */</script>
+</body>
+</html>

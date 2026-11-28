@@ -1,10 +1,7 @@
-mod scan;
-mod vault;
-mod windows;
-
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use serde_json::Value;
+use larchscan::{scan, vault, windows};
+use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -81,14 +78,35 @@ fn run() -> Result<u8> {
     let cli = Cli::parse();
     let vault = || vault_dir(cli.vault.as_deref());
     match cli.command {
-        Command::Scan { path, detection } => return scan::tree(&detection.load()?, &path),
+        Command::Scan { path, detection } => {
+            let summary = scan::tree(
+                &detection.load()?,
+                &path,
+                || false,
+                |event| emit(serde_json::to_value(event)?),
+            )?;
+            emit(json!({
+                "event":"summary", "files_scanned":summary.files_scanned,
+                "files_with_findings":summary.files_with_findings, "incomplete":summary.incomplete
+            }))?;
+            return Ok(summary.exit_code());
+        }
         Command::Quarantine {
             path,
             expect,
             detection,
-        } => vault::quarantine(&vault()?, &path, &expect, &detection.load()?)?,
-        Command::List => vault::list(&vault()?)?,
-        Command::Restore { id, to } => vault::restore(&vault()?, id, &to)?,
+        } => emit(
+            json!({"event":"quarantined","receipt":vault::quarantine(&vault()?, &path, &expect, &detection.load()?)?}),
+        )?,
+        Command::List => {
+            for receipt in vault::list(&vault()?)? {
+                emit(json!({"event":"archived","receipt":receipt}))?;
+            }
+        }
+        Command::Restore { id, to } => {
+            let sha256 = vault::restore(&vault()?, id, &to)?;
+            emit(json!({"event":"restored","id":id,"to":to,"sha256":sha256}))?;
+        }
     }
     Ok(0)
 }

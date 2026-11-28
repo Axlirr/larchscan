@@ -2,7 +2,7 @@
 
 LarchScan is an on-demand Windows file triage tool written in Rust. Scan a directory and each file gets a SHA-256 digest, the rules it matched, and the reason for each finding. Review a finding and pass its digest back to quarantine exactly those bytes. The CLI emits JSON Lines for scripts and incident records.
 
-Version 0.1.0 targets Windows x64 and local NTFS directories. Its built-in rules recognize the harmless verification fixture and Windows executables with misleading document or image names. You can load your own SHA-256 indicators or ask your installed Windows antimalware provider for a verdict with `--amsi`. A filename mismatch calls for review. An empty findings list means the selected checks found no match.
+LarchScan targets Windows x64 and local NTFS directories. Its built-in rules recognize the harmless verification fixture and Windows executables with misleading document or image names. You can load your own SHA-256 indicators or ask your installed Windows antimalware provider for a verdict with `--amsi`. A filename mismatch calls for review. An empty findings list means the selected checks found no match.
 
 ## Try it on a harmless file
 
@@ -12,12 +12,13 @@ Extract the Windows release ZIP, open PowerShell in the extracted directory, and
 $lab = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ([guid]::NewGuid().ToString()))
 $file = Join-Path $lab.FullName 'sample.txt'
 $vault = Join-Path $lab.FullName 'vault'
+$scanner = '.\tools\larchscan.exe'
 [IO.File]::WriteAllBytes($file, [IO.File]::ReadAllBytes((Resolve-Path '.\examples\demo.txt').Path))
-$events = .\larchscan.exe scan $file | ForEach-Object { $_ | ConvertFrom-Json }
+$events = & $scanner scan $file | ForEach-Object { $_ | ConvertFrom-Json }
 $events[0].verdict.findings
-$result = .\larchscan.exe quarantine $file --expect $events[0].verdict.sha256 --vault $vault | ConvertFrom-Json
-.\larchscan.exe list --vault $vault
-.\larchscan.exe restore $result.receipt.id --to $file --vault $vault
+$result = & $scanner quarantine $file --expect $events[0].verdict.sha256 --vault $vault | ConvertFrom-Json
+& $scanner list --vault $vault
+& $scanner restore $result.receipt.id --to $file --vault $vault
 Get-FileHash -LiteralPath $file
 ```
 
@@ -26,8 +27,8 @@ The expected finding is `demo.fixture`. The restored digest is `3d4d3fb8ab38ddc7
 ## Scan and interpret the result
 
 ```powershell
-.\larchscan.exe scan C:\cases\incoming
-.\larchscan.exe scan C:\cases\incoming --rules .\indicators.json --amsi
+.\tools\larchscan.exe scan C:\cases\incoming
+.\tools\larchscan.exe scan C:\cases\incoming --rules .\indicators.json --amsi
 ```
 
 Each `file` event includes the digest, finding IDs and reasons. With AMSI enabled it also includes the provider's numeric result or error. `amsi.policy` identifies an administrative block. `amsi.detected` identifies a malware verdict. The provider controls its own definitions, connectivity and data handling. [Microsoft AMSI result definitions](https://learn.microsoft.com/en-us/windows/win32/api/amsi/ne-amsi-amsi_result)
