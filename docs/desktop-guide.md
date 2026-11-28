@@ -1,57 +1,52 @@
 # LarchScan desktop guide
 
-Run **LarchScan-0.3.0-Setup.exe** to install per-user (Start Menu shortcut, optional Desktop shortcut, optional CLI `PATH` entry, and an Add/Remove Programs uninstaller), or extract the portable ZIP and open **LarchScan.exe**. Because the current release is unsigned, Windows Defender SmartScreen may show *"Windows protected your PC"* on first launch — click **More info → Run anyway** after verifying the SHA-256 checksum.
+Run **LarchScan-0.4.0-Setup.exe** to install per-user (Start Menu shortcut, optional Desktop shortcut, optional CLI `PATH` entry, and an Add/Remove Programs uninstaller), or extract the portable ZIP and open **LarchScan.exe**. Because the current release is unsigned, Windows Defender SmartScreen may show *"Windows protected your PC"* on first launch — click **More info → Run anyway** after verifying the SHA-256 checksum.
 
-The app uses standard Windows file and folder pickers and does not require administrator access for scanning files you can already read. Uninstalling LarchScan removes the program files and shortcuts while preserving your local reports and quarantine vault under `%LOCALAPPDATA%\LarchScan`.
+The app uses standard Windows file and folder pickers and does not require administrator access for scanning files you can already read. Uninstalling LarchScan removes program files and shortcuts while preserving your local reports and quarantine vault under `%LOCALAPPDATA%\LarchScan`.
 
-## Scan
+## Scan options & Startup audit
 
-- **Quick scan** inspects the folders Windows identifies as **Downloads** and **Desktop** (deduplicated if they point to the same path).
-- **Single file** opens a file picker for a targeted scan.
+- **Quick scan** inspects **Downloads** and **Desktop** (including `.zip` archive interiors and PE Authenticode checks).
+- **Single file** opens a file picker for targeted inspection.
 - **Folder scan** walks the selected directory and its subfolders.
-- **System drive** walks the drive where Windows is installed. Inaccessible folders, reparse points, and files over 32 MiB appear as incomplete checks. The desktop app excludes its own storage directory.
+- **System drive** walks the Windows system drive (excluding LarchScan's own storage directory).
+- **Startup audit** (**Startup** tab) inspects Registry `Run`/`RunOnce` keys (HKCU & HKLM), User & Common Startup folders, and enabled non-OS Windows Scheduled Tasks. It flags script/LOLBin hosts (`persistence.script-host`), temp/Downloads targets (`persistence.temp-or-downloads`), unsigned user-writable binaries (`persistence.unsigned-user-binary`), missing targets (`persistence.missing-target`), and any file-rule matches on the target binary — without modifying registry keys automatically.
 
-Scans run in a background worker thread and open files with read/write/delete sharing so running applications are not disrupted. While a scan is running, a global status bar lets you view progress or stop the scan from any screen to save a partial report.
+Scans run on background threads with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` so active apps are not disrupted. A global status bar lets you view progress or stop an active scan from any tab.
 
-You can also launch the app directly against a target path from PowerShell:
+Command-line launch options:
 
 ```powershell
 .\LarchScan.exe --scan "C:\Some Folder"
+.\LarchScan.exe --background-quick
 .\LarchScan.exe --help
 .\LarchScan.exe --version
 ```
 
-## Findings, quarantine, restore, and delete
+## Built-in checks & custom signed rule bundles
 
-Built-in triage checks include:
+- `demo.fixture`: Harmless verification fixture (`examples/demo.txt`).
+- `triage.document-named-pe`: Windows PE executables carrying document, image, media, or archive filenames (including space-padded double extensions such as `invoice.pdf .exe`).
+- `triage.double-extension-script`: Document or image names paired with Windows script/shortcut extensions (`.lnk`, `.bat`, `.cmd`, `.ps1`, `.vbs`, `.js`, `.hta`, `.msi`, etc.).
+- `triage.bidi-filename`: Filenames containing Unicode bidirectional override/isolate control characters (such as RTLO `U+202E`).
+- `triage.invalid-authenticode`: Embedded Windows Authenticode signature failed `WinVerifyTrust` integrity verification.
+- `triage.packed-unsigned-pe`: Unsigned PE with a known packer section (e.g., `UPX0`) or high executable code section Shannon entropy (≥ 7.45).
+- `archive.*`: Any of the above or custom rules matched inside a `.zip` file inspected safely in memory (up to 256 files, 8 MiB per entry, 32 MiB total uncompressed).
+- Custom SHA-256 arrays or structured `larchscan-rules/1` pattern bundles (`ascii`, `ascii_nocase`, `hex`, `utf16le` strings with extension/PE/entropy filters) plus optional **Ed25519 public key verification** in **Settings** (fail-closed if unsigned or tampered).
+- Optional Windows AMSI verdicts (`amsi.detected`, `amsi.policy`; 0-byte files are skipped cleanly).
 
-- `demo.fixture`: Built-in harmless SHA-256 verification fixture (`examples/demo.txt`).
-- `triage.document-named-pe`: Valid Windows PE executables carrying document, image, media, or archive filenames (including space-padded double extensions such as `invoice.pdf .exe`).
-- `triage.double-extension-script`: Document or image names paired with Windows script or shortcut launcher extensions (such as `.pdf.lnk` or `.docx .ps1`).
-- `triage.bidi-filename`: Filenames containing Unicode bidirectional override or isolate control characters (such as RTLO `U+202E`).
-- Custom analyst SHA-256 rules and optional Windows AMSI verdicts (`amsi.detected`, `amsi.policy`).
+## Quarantine, restore, and delete
 
-From **Scan results**, you can filter findings or skipped rows by filename, path, or rule, copy a file's SHA-256 digest, reveal the file in File Explorer, or choose **Quarantine…**. After confirmation, LarchScan verifies the digest and applicable rules again under an exclusive file handle, archives the primary bytes plus any Windows `Zone.Identifier` (Mark-of-the-Web) stream, verifies the written archive by streaming readback, and removes the original.
+From **Scan results** (or **Startup** when a target file matched a file rule), review the finding reasons, PE signature badge, SHA-256 hash, copy hash or reveal in File Explorer, and choose **Quarantine…** to archive under an exclusive file handle.
 
-In **Quarantine**, each entry shows the original path, the finding reasons that triggered archival, the archive timestamp, whether `Zone.Identifier` was preserved, and the SHA-256 digest:
+- Archives use `larchscan/2` (preserving Windows `Zone.Identifier` Mark-of-the-Web streams up to 16 KiB) while remaining backward-compatible with `larchscan/1`.
+- In **Quarantine**, each item shows finding reasons, archive timestamp, `Zone.Identifier` status, and SHA-256. **Restore…** verifies the full archive digest and writes to a new NTFS path without overwriting; **Delete…** permanently removes the `.lsq` file after confirmation.
+- Stray or corrupt `.lsq` files show a warning banner without hiding or blocking healthy archives.
 
-- **Restore…** verifies the archive integrity and writes the bytes to a new NTFS file path without overwriting existing files, reapplying the original `Zone.Identifier` stream (or `ZoneId=3` if none was recorded). The vault copy is retained until you delete it.
-- **Delete…** permanently removes the `.lsq` archive after confirmation.
+## Background Task Scheduler, System Tray & storage
 
-Files with alternate NTFS data streams other than `Zone.Identifier`, multiple hard links, EFS encryption, read-only attributes, or reparse points remain ineligible for quarantine and are left untouched. If a corrupt or stray `.lsq` file exists in the vault folder, LarchScan surfaces a warning without hiding or blocking healthy archives.
+- **Background Windows Task Scheduler (Settings):** Registers a per-user `LarchScan Quick Scan` task that runs `LarchScan.exe --background-quick` headlessly on your chosen interval (even when LarchScan is closed), saving reports to **Scan history** with an exclusive lockfile to prevent overlaps.
+- **Keep running in system tray (Settings):** Closing the window hides LarchScan to the Windows notification area (left-click to reopen, right-click for Quick Scan, Startup Audit, or Quit).
+- **Local storage:** Defaults to `%LOCALAPPDATA%\LarchScan` (overridable via `LARCHSCAN_DATA_DIR`). Up to 100 recent reports are retained and automatically pruned; individual reports or all history can be deleted in **Scan history**.
 
-## Reports, settings, and storage location
-
-By default, LarchScan saves settings, reports, WebView state, and quarantine archives under `%LOCALAPPDATA%\LarchScan`. You can override this root directory for portable or isolated triage by setting the `LARCHSCAN_DATA_DIR` environment variable before launching `LarchScan.exe`:
-
-```powershell
-$env:LARCHSCAN_DATA_DIR = "C:\Cases\Case01\larchscan-data"
-.\LarchScan.exe
-```
-
-- **Scan history** displays up to 100 recent reports and automatically prunes older report JSON files beyond 100. You can also delete individual reports or clear history from the **Scan history** screen.
-- Each saved report keeps full scan counts and up to 300 finding rows and 300 incomplete-check rows, including numeric AMSI results when enabled. Reports contain local file paths; review exports before sharing.
-- In **Settings**, you can enable Windows AMSI (empty 0-byte files are skipped cleanly without provider errors), choose a custom JSON SHA-256 rules file, open the local data folder, and configure scheduled quick scans.
-- Scheduled quick scans run while LarchScan stays open, display the next scheduled run time, skip an interval if another scan or vault operation is active, run without pulling you off your current tab, and never quarantine automatically.
-
-This release covers on-demand and scheduled file triage and recovery. It has no background protection service, maintained threat feed, rootkit scanning, ransomware rollback, or independently measured detection accuracy. [CLI and archive format](cli-guide.md)
+LarchScan has no kernel real-time blocking driver, network filter, or commercial threat feed. Keep Windows Defender or another real-time AV active alongside it. [CLI and archive format](cli-guide.md)

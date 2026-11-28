@@ -6,6 +6,10 @@ const state = {
     page: 'overview',
     tab: 'findings',
     filter: '',
+    startupFilter: '',
+    startupFlaggedOnly: false,
+    startupReport: null,
+    startupBusy: false,
     scanning: false,
     working: false,
     saved: false,
@@ -13,7 +17,14 @@ const state = {
     settings: {},
     quarantined: new Set()
 };
-const labels = { overview: 'Overview', scans: 'Scan results', vault: 'Quarantine', history: 'Scan history', settings: 'Settings' };
+const labels = {
+    overview: 'Overview',
+    scans: 'Scan results',
+    startup: 'Startup & persistence',
+    vault: 'Quarantine',
+    history: 'Scan history',
+    settings: 'Settings'
+};
 const number = value => (value ?? 0).toLocaleString();
 const formatTime = epoch => epoch ? new Date(epoch * 1000).toLocaleString() : '';
 let toastTimer;
@@ -30,6 +41,7 @@ function vaultKey(path, sha256) {
 }
 
 function page(name) {
+    if (!labels[name]) return;
     state.page = name;
     for (const section of document.querySelectorAll('.page')) section.hidden = section.id !== name;
     for (const button of document.querySelectorAll('nav [data-page]')) {
@@ -96,18 +108,26 @@ function status(report) {
     return report.summary.incomplete ? 'Completed with incomplete checks' : 'Completed';
 }
 
-async function copyHash(sha256) {
+async function copyText(text, label) {
     try {
-        await navigator.clipboard.writeText(sha256);
-        notify('SHA-256 copied to clipboard.');
+        await navigator.clipboard.writeText(text);
+        notify(label + ' copied to clipboard.');
     } catch {
         notify('Could not copy to clipboard.', true);
     }
 }
 
-function matchesFilter(text) {
-    if (!state.filter) return true;
-    return text.toLowerCase().includes(state.filter);
+function matchesFilter(text, query) {
+    if (!query) return true;
+    return text.toLowerCase().includes(query);
+}
+
+function sigLabel(sig) {
+    if (sig === 'valid') return ['badge ok', 'Authenticode valid'];
+    if (sig === 'invalid') return ['badge bad', 'Invalid signature'];
+    if (sig === 'untrusted') return ['badge warn-pill', 'Untrusted signature'];
+    if (sig === 'unsigned') return ['badge neutral', 'Unsigned PE'];
+    return null;
 }
 
 function renderReportRows() {
@@ -122,7 +142,7 @@ function renderReportRows() {
             item.sha256,
             ...item.rules.map(rule => rule.id + ' ' + rule.reason)
         ].join('\n');
-        if (!matchesFilter(haystack)) return;
+        if (!matchesFilter(haystack, state.filter)) return;
 
         const archived = state.quarantined.has(vaultKey(item.path, item.sha256));
         const buttons = element('div', 'record-actions');
@@ -134,11 +154,25 @@ function renderReportRows() {
             );
         }
         buttons.append(
-            action('Copy hash', () => copyHash(item.sha256)),
+            action('Copy hash', () => copyText(item.sha256, 'SHA-256')),
             action('Show file', () => request('reveal_in_explorer', { path: item.path }))
         );
 
         const [row, copy] = record(item.path.split(/[\\/]/).at(-1), item.path, buttons);
+
+        const pills = element('div', 'pill-row');
+        if (item.pe) {
+            const sig = sigLabel(item.pe.signature);
+            if (sig) pills.append(element('span', sig[0], sig[1]));
+            if (item.pe.max_code_entropy > 0) {
+                pills.append(element('span', 'badge neutral', item.pe.format + ' · entropy ' + item.pe.max_code_entropy.toFixed(2)));
+            }
+        }
+        if (item.archive_entries !== null && item.archive_entries !== undefined) {
+            pills.append(element('span', 'badge neutral', 'ZIP · ' + number(item.archive_entries) + ' file(s) inspected'));
+        }
+        if (pills.childNodes.length) copy.append(pills);
+
         for (const rule of item.rules) copy.append(element('p', 'rule', rule.id + ' · ' + rule.reason));
         const meta = ['SHA-256 ' + item.sha256];
         if (item.amsi_result !== null && item.amsi_result !== undefined) meta.push('AMSI ' + item.amsi_result);
@@ -154,7 +188,7 @@ function renderReportRows() {
     const skippedRows = [];
     for (const item of report.skipped) {
         const haystack = (item.path || '') + '\n' + (item.reason || '');
-        if (!matchesFilter(haystack)) continue;
+        if (!matchesFilter(haystack, state.filter)) continue;
         skippedRows.push(record(item.path || 'Unspecified path', item.reason)[0]);
     }
     const emptySkipped = state.filter
@@ -169,6 +203,60 @@ function renderReportRows() {
             }
         }
     }
+    updateButtons();
+}
+
+function renderStartup() {
+    const report = state.startupReport;
+    if (!report) return;
+    $('startup-total').textContent = number(report.entries_checked);
+    $('startup-flagged').textContent = number(report.flagged);
+    $('startup-missing').textContent = number(report.missing_targets);
+    $('stat-startup-flagged').classList.toggle('alert', report.flagged > 0);
+    $('stat-startup-missing').classList.toggle('warn', report.missing_targets > 0);
+
+    const rows = [];
+    for (const item of report.entries) {
+        if (state.startupFlaggedOnly && !item.findings.length) continue;
+        const haystack = [
+            item.name,
+            item.source,
+            item.location,
+            item.command,
+            item.target_path || '',
+            ...item.findings.map(f => f.id + ' ' + f.reason)
+        ].join('\n');
+        if (!matchesFilter(haystack, state.startupFilter)) continue;
+
+        const buttons = element('div', 'record-actions');
+        const hasFileFinding = item.target_path && item.sha256 && item.findings.some(f => !f.id.startsWith('persistence.'));
+        if (hasFileFinding) {
+            const archived = state.quarantined.has(vaultKey(item.target_path, item.sha256));
+            buttons.append(
+                archived
+                    ? element('span', 'badge', 'In quarantine')
+                    : action('Quarantine…', () => request('quarantine_file', { path: item.target_path, sha256: item.sha256 }), { operable: false })
+            );
+        }
+        buttons.append(action('Copy command', () => copyText(item.command, 'Command')));
+        if (item.target_path && !item.target_missing) {
+            buttons.append(action('Show file', () => request('reveal_in_explorer', { path: item.target_path })));
+        }
+
+        const [row, copy] = record(item.name || '(Unnamed entry)', item.location + ' · ' + item.command, buttons);
+        const pills = element('div', 'pill-row');
+        pills.append(element('span', 'badge neutral', item.source));
+        const sig = sigLabel(item.signature);
+        if (sig) pills.append(element('span', sig[0], sig[1]));
+        if (item.target_missing) pills.append(element('span', 'badge warn-pill', 'Target missing'));
+        copy.append(pills);
+
+        for (const f of item.findings) copy.append(element('p', 'rule', f.id + ' · ' + f.reason));
+        if (item.sha256) copy.append(element('p', 'hash', 'SHA-256 ' + item.sha256));
+        rows.push(row);
+    }
+
+    list($('startup-rows'), rows, report.entries.length ? 'No startup entries match the current filter.' : 'No startup entries found.');
     updateButtons();
 }
 
@@ -203,9 +291,34 @@ function showSettings(settings) {
     state.settings = settings;
     $('amsi').checked = Boolean(settings.amsi);
     $('schedule').value = String(settings.schedule_minutes ?? 0);
-    $('rule-file').textContent = settings.rules || 'No custom rule file selected.';
+    $('bg-scheduler').checked = Boolean(settings.background_scheduler);
+    $('tray-mode').checked = Boolean(settings.minimize_to_tray);
+    $('rule-file').textContent = settings.rules || 'No custom rule file selected. Supports SHA-256 arrays and larchscan-rules/1 pattern bundles.';
     $('clear-rules').hidden = !settings.rules;
+    $('rules-pubkey').value = settings.rules_pubkey || '';
     if (settings.data_dir) $('data-dir').textContent = settings.data_dir;
+
+    const rs = settings.rules_summary;
+    if (rs && settings.rules) {
+        const parts = [];
+        if (rs.format) parts.push(rs.format);
+        if (rs.version) parts.push('v' + rs.version);
+        if (rs.publisher) parts.push(rs.publisher);
+        parts.push(number(rs.hash_count) + ' hash(es), ' + number(rs.pattern_count) + ' pattern(s)');
+        if (rs.signature_verified) parts.push('Ed25519 signature verified');
+        $('rule-meta').textContent = parts.join(' · ');
+        $('rule-meta').hidden = false;
+    } else {
+        $('rule-meta').hidden = true;
+    }
+
+    const ts = settings.task_status;
+    if (ts && ts.registered) {
+        $('task-status-note').textContent = 'Windows Task registered' + (ts.next_run ? ' · Next run: ' + ts.next_run : '');
+        $('task-status-note').hidden = false;
+    } else {
+        $('task-status-note').hidden = true;
+    }
 
     const nextText = settings.next_scan_epoch
         ? 'Next scheduled quick scan: ' + formatTime(settings.next_scan_epoch)
@@ -252,6 +365,7 @@ function showVault(report) {
     }), 'The quarantine vault is empty.');
 
     if (state.report) renderReportRows();
+    if (state.startupReport) renderStartup();
     updateButtons();
 }
 
@@ -263,7 +377,18 @@ function updateLiveBar() {
 function updateButtons() {
     const busy = state.scanning || state.working;
     document.querySelectorAll('.scan-action,[data-operation]').forEach(button => { button.disabled = busy; });
-    const mode = state.scanning ? 'Scan in progress' : state.settings.schedule_minutes ? 'Quick scan scheduled' : 'On-demand scanner';
+    const runStartup = $('run-startup');
+    if (runStartup) {
+        runStartup.disabled = state.startupBusy || state.working;
+        runStartup.textContent = state.startupBusy ? 'Scanning startup…' : 'Scan startup items';
+    }
+    const mode = state.scanning
+        ? 'Scan in progress'
+        : state.settings.background_scheduler
+            ? 'Background task active'
+            : state.settings.schedule_minutes
+                ? 'Quick scan scheduled'
+                : 'On-demand scanner';
     $('mode').replaceChildren(element('i'), document.createTextNode(mode));
     updateLiveBar();
 }
@@ -280,6 +405,9 @@ function setStoppingState() {
 
 window.receive = ({ event, data }) => {
     switch (event) {
+        case 'navigate':
+            page(data);
+            break;
         case 'started': {
             const scope = typeof data === 'string' ? data : data.scope;
             const scheduled = typeof data === 'object' && Boolean(data.scheduled);
@@ -323,6 +451,15 @@ window.receive = ({ event, data }) => {
             }
             updateButtons();
             break;
+        case 'startup_busy':
+            state.startupBusy = Boolean(data);
+            updateButtons();
+            break;
+        case 'startup_report':
+            state.startupReport = data;
+            renderStartup();
+            notify('Startup audit finished: ' + number(data.entries_checked) + ' checked, ' + number(data.flagged) + ' flagged.');
+            break;
         case 'report':
             if (state.scanning) { notify('Stop or finish the active scan before opening a saved report.', true); break; }
             page('scans');
@@ -354,6 +491,7 @@ window.receive = ({ event, data }) => {
         case 'quarantined':
             state.quarantined.add(vaultKey(data.original, data.sha256));
             if (state.report) renderReportRows();
+            if (state.startupReport) renderStartup();
             notify('File archived. It is available in Quarantine.');
             break;
         case 'notice': notify(data); break;
@@ -370,13 +508,25 @@ for (const button of document.querySelectorAll('[data-action]')) button.onclick 
     if (button.dataset.action === 'cancel') setStoppingState();
     request(button.dataset.action);
 };
+$('overview-startup').onclick = () => { page('startup'); request('scan_startup'); };
 $('export').onclick = () => { if (state.report) request('export', { id: state.report.id }); };
 $('filter-input').oninput = event => {
     state.filter = event.target.value.trim().toLowerCase();
     renderReportRows();
 };
+$('startup-filter').oninput = event => {
+    state.startupFilter = event.target.value.trim().toLowerCase();
+    renderStartup();
+};
+$('startup-flagged-only').onchange = event => {
+    state.startupFlaggedOnly = event.target.checked;
+    renderStartup();
+};
 $('amsi').onchange = event => request('set_amsi', { enabled: event.target.checked });
 $('schedule').onchange = event => request('set_schedule', { minutes: Number(event.target.value) });
+$('bg-scheduler').onchange = event => request('set_background_scheduler', { enabled: event.target.checked });
+$('tray-mode').onchange = event => request('set_minimize_to_tray', { enabled: event.target.checked });
+$('save-pubkey').onclick = () => request('set_rules_pubkey', { pubkey: $('rules-pubkey').value });
 showHistory([]);
 list($('findings'), [], 'Start a scan or open a saved report from Scan history.');
 list($('skipped'), [], 'Incomplete checks from your scan will appear here.');

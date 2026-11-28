@@ -1,7 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use flate2::{Compression, write::DeflateEncoder};
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -74,6 +76,70 @@ fn records(out: Output) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn build_zip(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for &(name, data, deflate) in entries {
+        let local_offset = out.len() as u32;
+        let (method, payload) = if deflate {
+            let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(data).unwrap();
+            (8u16, enc.finish().unwrap())
+        } else {
+            (0u16, data.to_vec())
+        };
+        let name_bytes = name.as_bytes();
+        // Local file header
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&method.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc unused by our reader
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&payload);
+
+        // Central directory entry
+        central.extend_from_slice(b"PK\x01\x02");
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&method.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&local_offset.to_le_bytes());
+        central.extend_from_slice(name_bytes);
+    }
+    let cd_offset = out.len() as u32;
+    let cd_size = central.len() as u32;
+    out.extend_from_slice(&central);
+
+    // End of central directory
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
 }
 
 #[test]
@@ -302,6 +368,162 @@ fn custom_rules_and_invalid_digests() {
     rule[0]["sha256"] = json!("invalid");
     fs::write(&rules, rule.to_string()).unwrap();
     lab.run(&args, 2);
+}
+
+#[test]
+fn zip_archive_inspection_flags_nested_disguised_files_and_fixtures() {
+    let lab = Lab::new();
+    let bad_zip = lab.root.path().join("attachments.zip");
+    let bytes = build_zip(&[
+        ("readme.txt", b"normal notes", false),
+        ("nested/invoice.pdf.lnk", b"shortcut bytes", true),
+        ("nested/demo.txt", DEMO, true),
+    ]);
+    fs::write(&bad_zip, bytes).unwrap();
+
+    let events = records(lab.run(&["scan".as_ref(), bad_zip.as_os_str()], 1));
+    assert_eq!(events[0]["verdict"]["archive_entries"], 3);
+    let ids: Vec<&str> = events[0]["verdict"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"archive.triage.double-extension-script"));
+    assert!(ids.contains(&"archive.demo.fixture"));
+
+    let clean_zip = lab.root.path().join("clean.zip");
+    fs::write(&clean_zip, build_zip(&[("notes.txt", b"harmless", true)])).unwrap();
+    let clean_events = records(lab.run(&["scan".as_ref(), clean_zip.as_os_str()], 0));
+    assert_eq!(clean_events[0]["verdict"]["archive_entries"], 1);
+    assert_eq!(clean_events[0]["verdict"]["findings"], json!([]));
+}
+
+#[test]
+fn signed_pattern_rule_bundle_keygen_sign_verify_and_tamper_rejection() {
+    let lab = Lab::new();
+    let keys_dir = lab.root.path().join("keys");
+    let kg = records(lab.run(
+        &[
+            "rules".as_ref(),
+            "keygen".as_ref(),
+            "--out".as_ref(),
+            keys_dir.as_os_str(),
+        ],
+        0,
+    ));
+    let pubkey = kg[0]["public_key_hex"].as_str().unwrap().to_owned();
+    let priv_file = keys_dir.join("larchscan-rules.key");
+
+    let unsigned_bundle = lab.root.path().join("bundle.json");
+    let signed_bundle = lab.root.path().join("bundle.signed.json");
+    let bundle_json = json!({
+        "format": "larchscan-rules/1",
+        "version": "2026.11.28",
+        "publisher": "Test Team",
+        "hashes": [],
+        "patterns": [
+            {
+                "id": "pat.demo-cradle",
+                "reason": "Matched custom pattern test strings",
+                "extensions": ["ps1", "txt"],
+                "match_all": true,
+                "strings": [
+                    {"kind": "ascii_nocase", "value": "FromBase64String"},
+                    {"kind": "hex", "value": "57 52 49 54 45"}
+                ]
+            }
+        ]
+    });
+    fs::write(&unsigned_bundle, bundle_json.to_string()).unwrap();
+
+    lab.run(
+        &[
+            "rules".as_ref(),
+            "sign".as_ref(),
+            unsigned_bundle.as_os_str(),
+            "--key".as_ref(),
+            priv_file.as_os_str(),
+            "--out".as_ref(),
+            signed_bundle.as_os_str(),
+        ],
+        0,
+    );
+    lab.run(
+        &[
+            "rules".as_ref(),
+            "verify".as_ref(),
+            signed_bundle.as_os_str(),
+            "--pubkey".as_ref(),
+            pubkey.as_ref(),
+        ],
+        0,
+    );
+
+    let script = lab.root.path().join("probe.ps1");
+    fs::write(&script, b"WRITE [Convert]::frombase64string('ok')").unwrap();
+    let matched = records(lab.run(
+        &[
+            "scan".as_ref(),
+            script.as_os_str(),
+            "--rules".as_ref(),
+            signed_bundle.as_os_str(),
+            "--rules-pubkey".as_ref(),
+            pubkey.as_ref(),
+        ],
+        1,
+    ));
+    assert_eq!(
+        matched[0]["verdict"]["findings"][0]["id"],
+        "pat.demo-cradle"
+    );
+
+    // Unsigned bundle fails closed when --rules-pubkey is supplied.
+    lab.run(
+        &[
+            "scan".as_ref(),
+            script.as_os_str(),
+            "--rules".as_ref(),
+            unsigned_bundle.as_os_str(),
+            "--rules-pubkey".as_ref(),
+            pubkey.as_ref(),
+        ],
+        2,
+    );
+
+    // Tampered signed bundle fails closed.
+    let tampered_text = fs::read_to_string(&signed_bundle)
+        .unwrap()
+        .replace("Test Team", "Evil Team");
+    let tampered = lab.root.path().join("bundle.tampered.json");
+    fs::write(&tampered, tampered_text).unwrap();
+    lab.run(
+        &[
+            "scan".as_ref(),
+            script.as_os_str(),
+            "--rules".as_ref(),
+            tampered.as_os_str(),
+            "--rules-pubkey".as_ref(),
+            pubkey.as_ref(),
+        ],
+        2,
+    );
+}
+
+#[test]
+fn startup_command_emits_valid_jsonl_summary() {
+    let out = Command::new(env!("CARGO_BIN_EXE_larchscan"))
+        .arg("startup")
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap();
+    assert!(
+        code == 0 || code == 1,
+        "unexpected startup exit code {code}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events = records(out);
+    assert_eq!(events.last().unwrap()["event"], "startup_summary");
 }
 
 #[test]

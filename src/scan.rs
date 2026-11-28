@@ -1,8 +1,10 @@
-use crate::windows::{Amsi, disk_path, paths_equal, regular_file};
-use anyhow::{Context, Result, ensure};
+use crate::archive;
+use crate::pe::{self, PeSummary, SignatureStatus};
+use crate::rules::{BundleSummary, HashRule, RuleSet, load_ruleset};
+use crate::windows::{Amsi, disk_path, paths_equal, regular_file, verify_authenticode};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
@@ -16,6 +18,7 @@ use windows_sys::Win32::System::Antimalware::{
 
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
+const MAX_ARCHIVE_FINDINGS: usize = 25;
 
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -59,14 +62,6 @@ pub fn read_bytes_with_limit(
     Ok(Some(bytes))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Rule {
-    id: String,
-    sha256: String,
-    reason: String,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Finding {
     pub id: String,
@@ -74,7 +69,7 @@ pub struct Finding {
 }
 
 pub struct Engine {
-    rules: HashMap<String, Finding>,
+    ruleset: RuleSet,
     amsi: Option<Amsi>,
 }
 
@@ -165,34 +160,12 @@ fn has_bidi_override(path: &Path) -> bool {
     })
 }
 
-fn is_valid_pe(bytes: &[u8]) -> bool {
-    if !bytes.starts_with(b"MZ") || bytes.len() < 64 {
+fn document_named_pe(path: &Path, pe: Option<&PeSummary>) -> bool {
+    if pe.is_none() {
         return false;
     }
-    let offset = u32::from_le_bytes(bytes[60..64].try_into().expect("four-byte offset")) as usize;
-    let Some(header) = bytes.get(offset..).filter(|h| h.len() >= 26) else {
-        return false;
-    };
-    let optional_len = u16::from_le_bytes([header[20], header[21]]) as usize;
-    let sections = u16::from_le_bytes([header[6], header[7]]) as usize;
-    let Some(required_len) = 24usize
-        .checked_add(optional_len)
-        .and_then(|n| n.checked_add(sections.checked_mul(40)?))
-    else {
-        return false;
-    };
-    offset >= 4
-        && header.starts_with(b"PE\0\0")
-        && sections >= 1
-        && (header[22] & 2) != 0
-        && optional_len >= 2
-        && header.len() >= required_len
-        && matches!(u16::from_le_bytes([header[24], header[25]]), 0x10b | 0x20b)
-}
-
-fn document_named_pe(path: &Path, bytes: &[u8]) -> bool {
     let double_extension = pe_launcher_extension(path) && trimmed_stem_has_document_extension(path);
-    (document_extension(path) || double_extension) && is_valid_pe(bytes)
+    document_extension(path) || double_extension
 }
 
 fn double_extension_script(path: &Path) -> bool {
@@ -205,60 +178,88 @@ pub struct Verdict {
     pub findings: Vec<Finding>,
     pub amsi_result: Option<i32>,
     pub provider_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pe: Option<PeSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_entries: Option<usize>,
 }
 
 impl Engine {
     pub fn load(path: Option<&Path>, amsi: bool) -> Result<Self> {
-        let demo = Rule {
+        Self::load_with_options(path, None, amsi)
+    }
+
+    pub fn load_with_options(
+        path: Option<&Path>,
+        rules_pubkey_hex: Option<&str>,
+        amsi: bool,
+    ) -> Result<Self> {
+        let demo = HashRule {
             id: "demo.fixture".into(),
             sha256: digest(include_bytes!("../examples/demo.txt")),
             reason: "Harmless verification fixture matched the built-in SHA-256 rule".into(),
         };
-        let mut loaded = vec![demo];
-        if let Some(path) = path {
-            let bytes = read_bytes(&regular_file(path, false)?)?;
-            loaded
-                .extend(serde_json::from_slice::<Vec<Rule>>(&bytes).context("invalid rule file")?);
-        }
-        let mut ids = HashSet::new();
-        let mut rules = HashMap::new();
-        for rule in loaded {
-            ensure!(
-                !rule.id.trim().is_empty()
-                    && !rule.reason.trim().is_empty()
-                    && !rule.id.starts_with("amsi.")
-                    && !rule.id.starts_with("triage."),
-                "invalid rule id or reason"
-            );
-            ensure!(
-                rule.sha256.len() == 64 && rule.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
-                "invalid SHA-256 in {}",
-                rule.id
-            );
-            ensure!(ids.insert(rule.id.clone()), "duplicate rule id {}", rule.id);
-            ensure!(
-                rules
-                    .insert(
-                        rule.sha256.to_ascii_lowercase(),
-                        Finding {
-                            id: rule.id,
-                            reason: rule.reason
-                        }
-                    )
-                    .is_none(),
-                "duplicate SHA-256"
-            );
-        }
+        let custom_bytes = match path {
+            Some(path) => Some(read_bytes(&regular_file(path, false)?)?),
+            None => None,
+        };
+        let pubkey = rules_pubkey_hex.map(str::trim).filter(|s| !s.is_empty());
+        let ruleset = load_ruleset(demo, custom_bytes.as_deref(), pubkey)?;
         Ok(Self {
-            rules,
+            ruleset,
             amsi: if amsi { Some(Amsi::start()?) } else { None },
         })
     }
 
-    pub fn inspect(&self, path: &Path, bytes: &[u8]) -> Verdict {
+    pub fn rules_summary(&self) -> &BundleSummary {
+        &self.ruleset.summary
+    }
+
+    fn inspect_core(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        verify_disk_signature: bool,
+    ) -> (String, Vec<Finding>, Option<PeSummary>) {
         let sha256 = digest(bytes);
-        let mut findings: Vec<_> = self.rules.get(&sha256).cloned().into_iter().collect();
-        if document_named_pe(path, bytes) {
+        let mut findings: Vec<_> = self
+            .ruleset
+            .hashes
+            .get(&sha256)
+            .cloned()
+            .into_iter()
+            .collect();
+        let mut pe_info = pe::analyze(bytes);
+
+        if let Some(pe) = pe_info.as_mut() {
+            if verify_disk_signature && pe.has_authenticode_table && path.is_file() {
+                let sig = verify_authenticode(path);
+                if sig == SignatureStatus::Invalid {
+                    findings.push(Finding {
+                        id: "triage.invalid-authenticode".into(),
+                        reason: "Windows Authenticode signature is invalid or modified; review file integrity".into(),
+                    });
+                }
+                pe.signature = Some(sig);
+            } else if !pe.has_authenticode_table {
+                pe.signature = Some(SignatureStatus::Unsigned);
+            }
+
+            if pe.is_packed_or_high_entropy() && pe.signature != Some(SignatureStatus::Valid) {
+                let detail = match &pe.packer_section {
+                    Some(sec) => format!("known packer section '{sec}'"),
+                    None => format!("high executable code entropy ({:.2})", pe.max_code_entropy),
+                };
+                findings.push(Finding {
+                    id: "triage.packed-unsigned-pe".into(),
+                    reason: format!(
+                        "Unsigned Windows executable with {detail}; review before running"
+                    ),
+                });
+            }
+        }
+
+        if document_named_pe(path, pe_info.as_ref()) {
             findings.push(Finding {
                 id: "triage.document-named-pe".into(),
                 reason: "Windows executable headers and a document or image filename; review the file type".into(),
@@ -276,6 +277,42 @@ impl Engine {
                 reason: "Filename contains Unicode bidirectional control characters that can disguise the true extension".into(),
             });
         }
+
+        for pattern in &self.ruleset.patterns {
+            if pattern.matches(path, bytes, pe_info.as_ref()) {
+                findings.push(pattern.finding());
+            }
+        }
+
+        (sha256, findings, pe_info)
+    }
+
+    pub fn inspect(&self, path: &Path, bytes: &[u8]) -> Verdict {
+        let (sha256, mut findings, pe) = self.inspect_core(path, bytes, true);
+
+        let mut archive_entries = None;
+        if archive::is_zip_candidate(path, bytes) {
+            let mut added = 0usize;
+            let stats = archive::inspect_zip(bytes, |entry_name, entry_bytes| {
+                if added >= MAX_ARCHIVE_FINDINGS {
+                    return;
+                }
+                let virtual_path = Path::new(entry_name);
+                let (_, entry_findings, _) = self.inspect_core(virtual_path, entry_bytes, false);
+                for ef in entry_findings {
+                    if added >= MAX_ARCHIVE_FINDINGS {
+                        break;
+                    }
+                    findings.push(Finding {
+                        id: format!("archive.{}", ef.id),
+                        reason: format!("Inside archive entry '{entry_name}': {}", ef.reason),
+                    });
+                    added += 1;
+                }
+            });
+            archive_entries = Some(stats.entries_inspected);
+        }
+
         let mut provider_error = None;
         let mut amsi_result = None;
         if let Some(provider) = &self.amsi
@@ -315,6 +352,8 @@ impl Engine {
             findings,
             amsi_result,
             provider_error,
+            pe,
+            archive_entries,
         }
     }
 }

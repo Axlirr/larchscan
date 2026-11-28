@@ -14,7 +14,10 @@ const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 pub struct Settings {
     pub amsi: bool,
     pub rules: Option<PathBuf>,
+    pub rules_pubkey: Option<String>,
     pub schedule_minutes: u64,
+    pub background_scheduler: bool,
+    pub minimize_to_tray: bool,
 }
 
 #[derive(Serialize, Deserialize)]

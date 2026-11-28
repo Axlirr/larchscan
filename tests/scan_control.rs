@@ -2,8 +2,10 @@ use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use larchscan::pe::{self, SignatureStatus};
+use larchscan::persistence;
 use larchscan::scan::{Engine, ScanEvent, ScanOptions, tree_excluding, tree_with_options};
-use larchscan::windows::disk_path;
+use larchscan::windows::{disk_path, verify_authenticode};
 
 #[test]
 fn desktop_scan_skips_app_storage_and_can_stop_between_files() {
@@ -88,6 +90,99 @@ fn bidi_and_script_triage_rules_flag_spoofs_without_flagging_normal_files() {
 
     let benign_doc = engine.inspect(Path::new("C:\\case\\notes.pptx"), b"plain text");
     assert!(benign_doc.findings.is_empty());
+}
+
+#[test]
+fn pe_analyzer_detects_packer_sections_without_false_positive_on_own_binary() {
+    let cli_path = Path::new(env!("CARGO_BIN_EXE_larchscan"));
+    let cli_bytes = fs::read(cli_path).unwrap();
+    let summary = pe::analyze(&cli_bytes).expect("larchscan.exe should parse as PE");
+    assert_eq!(summary.format, "PE32+");
+    assert!(!summary.is_dll);
+    assert!(!summary.is_packed_or_high_entropy());
+
+    let engine = Engine::load(None, false).unwrap();
+    let own_verdict = engine.inspect(cli_path, &cli_bytes);
+    assert!(
+        own_verdict.findings.is_empty(),
+        "expected no false positives on own binary, got {:?}",
+        own_verdict.findings
+    );
+
+    // Construct a minimal valid PE32+ image with a known UPX0 packer section.
+    let mut synthetic = vec![0u8; 512];
+    synthetic[0..2].copy_from_slice(b"MZ");
+    synthetic[60..64].copy_from_slice(&64u32.to_le_bytes());
+    synthetic[64..68].copy_from_slice(b"PE\0\0");
+    synthetic[64 + 6..64 + 8].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+    synthetic[64 + 20..64 + 22].copy_from_slice(&160u16.to_le_bytes()); // optional header len
+    synthetic[64 + 22..64 + 24].copy_from_slice(&0x0002u16.to_le_bytes()); // EXECUTABLE_IMAGE
+    synthetic[64 + 24..64 + 26].copy_from_slice(&0x20bu16.to_le_bytes()); // PE32+
+    let sec_off = 64 + 24 + 160;
+    synthetic[sec_off..sec_off + 4].copy_from_slice(b"UPX0");
+    let packed_verdict = engine.inspect(Path::new(r"C:\case\packed.exe"), &synthetic);
+    assert!(
+        packed_verdict
+            .findings
+            .iter()
+            .any(|f| f.id == "triage.packed-unsigned-pe")
+    );
+}
+
+#[test]
+fn authenticode_distinguishes_signed_windows_binary_and_unsigned_binary() {
+    let unsigned = verify_authenticode(Path::new(env!("CARGO_BIN_EXE_larchscan")));
+    assert_eq!(unsigned, SignatureStatus::Unsigned);
+
+    let notepad = Path::new(r"C:\Windows\System32\notepad.exe");
+    if notepad.exists() {
+        let sig = verify_authenticode(notepad);
+        assert!(
+            sig == SignatureStatus::Valid || sig == SignatureStatus::Unsigned,
+            "unexpected signature status on notepad.exe: {sig:?}"
+        );
+    }
+}
+
+#[test]
+fn persistence_evaluator_flags_script_hosts_temp_drops_and_missing_targets() {
+    let engine = Engine::load(None, false).unwrap();
+
+    let ps = persistence::evaluate_entry(
+        "Registry Run",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        "Updater",
+        "powershell.exe -WindowStyle Hidden -EncodedCommand ZQBjAGgAbwA=",
+        None,
+        &engine,
+    );
+    assert!(
+        ps.findings
+            .iter()
+            .any(|f| f.id == "persistence.script-host")
+    );
+
+    let missing_drop = persistence::evaluate_entry(
+        "Registry Run",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        "Drop",
+        r#""C:\Users\Demo\Downloads\never-existed-9911.exe" --silent"#,
+        None,
+        &engine,
+    );
+    assert!(missing_drop.target_missing);
+    assert!(
+        missing_drop
+            .findings
+            .iter()
+            .any(|f| f.id == "persistence.temp-or-downloads")
+    );
+    assert!(
+        missing_drop
+            .findings
+            .iter()
+            .any(|f| f.id == "persistence.missing-target")
+    );
 }
 
 #[test]

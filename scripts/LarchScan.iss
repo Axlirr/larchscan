@@ -1,9 +1,9 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.0"
+  #define MyAppVersion "0.4.0"
 #endif
 
 #ifndef StageDir
-  #define StageDir "..\dist\larchscan-0.3.0-windows-x64"
+  #define StageDir "..\dist\larchscan-0.4.0-windows-x64"
 #endif
 
 #ifndef OutDir
