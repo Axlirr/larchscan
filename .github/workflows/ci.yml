@@ -26,5 +26,6 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-features
 
-      - name: Build release binaries
-        run: cargo build --locked --release --features desktop --bins
+      - name: Build release binaries and Windows installer
+        shell: pwsh
+        run: .\scripts\package-release.ps1

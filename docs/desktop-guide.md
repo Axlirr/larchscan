@@ -1,6 +1,8 @@
 # LarchScan desktop guide
 
-Extract the Windows release ZIP and open **LarchScan.exe**. The app uses standard Windows file and folder pickers and does not require administrator access for scanning files you can already read.
+Run **LarchScan-0.3.0-Setup.exe** to install per-user (Start Menu shortcut, optional Desktop shortcut, optional CLI `PATH` entry, and an Add/Remove Programs uninstaller), or extract the portable ZIP and open **LarchScan.exe**. Because the current release is unsigned, Windows Defender SmartScreen may show *"Windows protected your PC"* on first launch — click **More info → Run anyway** after verifying the SHA-256 checksum.
+
+The app uses standard Windows file and folder pickers and does not require administrator access for scanning files you can already read. Uninstalling LarchScan removes the program files and shortcuts while preserving your local reports and quarantine vault under `%LOCALAPPDATA%\LarchScan`.
 
 ## Scan
 

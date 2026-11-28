@@ -1,6 +1,7 @@
 param(
     [string]$OutDir = "dist",
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$SkipInstaller
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,31 +44,20 @@ try {
     $bundleName = "larchscan-$version-windows-x64"
     $stage = Join-Path $outPath $bundleName
     $zipPath = Join-Path $outPath "$bundleName.zip"
+    $setupPath = Join-Path $outPath "LarchScan-$version-Setup.exe"
     $sumsPath = Join-Path $outPath "larchscan-$version-SHA256SUMS.txt"
 
     if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
     if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
-    New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "tools"), (Join-Path $stage "docs\images"), (Join-Path $stage "examples") | Out-Null
+    if (Test-Path $setupPath) { Remove-Item -Force $setupPath }
+    New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "tools"), (Join-Path $stage "examples") | Out-Null
 
     Copy-Item $desktopExe (Join-Path $stage "LarchScan.exe")
     Copy-Item $cliExe (Join-Path $stage "tools\larchscan.exe")
-    Copy-Item (Join-Path $repoRoot "LICENSE") $stage
-    Copy-Item (Join-Path $repoRoot "README.md") $stage
-    Copy-Item (Join-Path $repoRoot "RESEARCH.md") $stage
-    Copy-Item (Join-Path $repoRoot "docs\desktop-guide.md") (Join-Path $stage "docs")
-    Copy-Item (Join-Path $repoRoot "docs\cli-guide.md") (Join-Path $stage "docs")
     Copy-Item (Join-Path $repoRoot "examples\demo.txt") (Join-Path $stage "examples")
+    Copy-Item (Join-Path $repoRoot "LICENSE") $stage
 
-    # Include only images referenced by v0.3 documentation.
-    foreach ($img in @("larchscan-icon.png", "desktop-overview.png", "desktop-results.png", "desktop-quarantine.png", "desktop-settings.png")) {
-        $srcImg = Join-Path $repoRoot "docs\images\$img"
-        if (Test-Path $srcImg) {
-            Copy-Item $srcImg (Join-Path $stage "docs\images")
-        }
-    }
-
-    # Generate a single concise, deduplicated third-party attribution file instead of shipping
-    # the 15 MB Rust compiler copyright dump and hundreds of loose files.
+    # Generate a single concise, deduplicated third-party attribution file.
     $notices = New-Object System.Collections.Generic.List[string]
     $notices.Add("LarchScan v$version - Third-Party Open-Source Notices")
     $notices.Add("====================================================")
@@ -76,7 +66,7 @@ try {
     $notices.Add("The Rust standard library is dual-licensed under MIT and Apache-2.0:")
     $notices.Add("https://github.com/rust-lang/rust/blob/master/COPYRIGHT")
     $notices.Add("")
-    $notices.Add("Resolved Cargo crate dependencies:")
+    $notices.Add("Resolved Cargo crate dependencies (Windows x64 + desktop):")
     $notices.Add("")
 
     $deps = $metaJson.packages |
@@ -91,15 +81,36 @@ try {
 
     Compress-Archive -Path $stage -DestinationPath $zipPath -CompressionLevel Optimal
 
+    $builtSetup = $false
+    if (-not $SkipInstaller) {
+        $iscc = @(
+            (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe',
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
+        ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+
+        if ($iscc) {
+            Write-Host "Building Windows installer with $iscc..."
+            & $iscc "/DMyAppVersion=$version" "/DStageDir=$stage" "/DOutDir=$outPath" (Join-Path $repoRoot "scripts\LarchScan.iss")
+            if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+            $builtSetup = Test-Path $setupPath
+        } else {
+            Write-Warning "Inno Setup (ISCC.exe) not found; skipping LarchScan-$version-Setup.exe build."
+        }
+    }
+
+    $sumLines = New-Object System.Collections.Generic.List[string]
+    if ($builtSetup) {
+        $setupHash = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $sumLines.Add("$setupHash  LarchScan-$version-Setup.exe")
+    }
     $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $desktopHash = (Get-FileHash -LiteralPath (Join-Path $stage "LarchScan.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
     $cliHash = (Get-FileHash -LiteralPath (Join-Path $stage "tools\larchscan.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
-
-    $sumLines = @(
-        "$zipHash  $bundleName.zip"
-        "$desktopHash  $bundleName/LarchScan.exe"
-        "$cliHash  $bundleName/tools/larchscan.exe"
-    )
+    $sumLines.Add("$zipHash  $bundleName.zip")
+    $sumLines.Add("$desktopHash  $bundleName/LarchScan.exe")
+    $sumLines.Add("$cliHash  $bundleName/tools/larchscan.exe")
     [IO.File]::WriteAllLines($sumsPath, $sumLines, [Text.UTF8Encoding]::new($false))
 
     $fileCount = (Get-ChildItem $stage -Recurse -File).Count
@@ -107,8 +118,11 @@ try {
     $zipBytes = (Get-Item $zipPath).Length
 
     Write-Host ""
-    Write-Host "Packaged: $zipPath ($([math]::Round($zipBytes / 1MB, 2)) MB)"
-    Write-Host "Extracted: $fileCount files, $([math]::Round($stageBytes / 1MB, 2)) MB"
+    if ($builtSetup) {
+        $setupBytes = (Get-Item $setupPath).Length
+        Write-Host "Installer: $setupPath ($([math]::Round($setupBytes / 1MB, 2)) MB)"
+    }
+    Write-Host "Portable ZIP: $zipPath ($([math]::Round($zipBytes / 1MB, 2)) MB; extracted: $fileCount files, $([math]::Round($stageBytes / 1MB, 2)) MB)"
     Write-Host "Checksums: $sumsPath"
     Get-Content $sumsPath
 } finally {
