@@ -227,8 +227,9 @@ pub fn read_registry_run_keys() -> Vec<RegistryRunEntry> {
             let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
             let u16_count = (data_len as usize) / 2;
             let mut wide_val = Vec::with_capacity(u16_count);
-            for chunk in data_buf[..u16_count * 2].chunks_exact(2) {
-                wide_val.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+            let (pairs, _) = data_buf[..u16_count * 2].as_chunks::<2>();
+            for &pair in pairs {
+                wide_val.push(u16::from_le_bytes(pair));
             }
             while wide_val.last() == Some(&0) {
                 wide_val.pop();
