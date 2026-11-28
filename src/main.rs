@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use larchscan::{scan, vault, windows};
 use serde_json::{Value, json};
@@ -39,6 +39,12 @@ enum Command {
         path: PathBuf,
         #[command(flatten)]
         detection: Detection,
+        /// Maximum file size to scan in MiB (default 32, range 1..=1024).
+        #[arg(long, value_name = "MB")]
+        max_mb: Option<usize>,
+        /// Exclude a directory or file path from traversal (repeatable).
+        #[arg(long, value_name = "PATH")]
+        exclude: Vec<PathBuf>,
     },
     /// Recheck a finding and archive its bytes before removing the original.
     Quarantine {
@@ -57,6 +63,8 @@ enum Command {
         #[arg(long)]
         to: PathBuf,
     },
+    /// Permanently delete an archived item from the quarantine vault.
+    Delete { id: Uuid },
 }
 
 fn vault_dir(override_path: Option<&Path>) -> Result<PathBuf> {
@@ -78,10 +86,27 @@ fn run() -> Result<u8> {
     let cli = Cli::parse();
     let vault = || vault_dir(cli.vault.as_deref());
     match cli.command {
-        Command::Scan { path, detection } => {
-            let summary = scan::tree(
+        Command::Scan {
+            path,
+            detection,
+            max_mb,
+            exclude,
+        } => {
+            let max_bytes = match max_mb {
+                Some(mb) => {
+                    ensure!(
+                        (1..=1024).contains(&mb),
+                        "--max-mb must be between 1 and 1024"
+                    );
+                    mb * 1024 * 1024
+                }
+                None => scan::MAX_BYTES,
+            };
+            let options = scan::ScanOptions { max_bytes, exclude };
+            let summary = scan::tree_with_options(
                 &detection.load()?,
                 &path,
+                &options,
                 || false,
                 |event| emit(serde_json::to_value(event)?),
             )?;
@@ -99,13 +124,25 @@ fn run() -> Result<u8> {
             json!({"event":"quarantined","receipt":vault::quarantine(&vault()?, &path, &expect, &detection.load()?)?}),
         )?,
         Command::List => {
-            for receipt in vault::list(&vault()?)? {
+            let report = vault::list_with_warnings(&vault()?)?;
+            for warning in report.warnings {
+                eprintln!(
+                    "warning: skipped {}: {}",
+                    warning.path.display(),
+                    warning.reason
+                );
+            }
+            for receipt in report.items {
                 emit(json!({"event":"archived","receipt":receipt}))?;
             }
         }
         Command::Restore { id, to } => {
             let sha256 = vault::restore(&vault()?, id, &to)?;
             emit(json!({"event":"restored","id":id,"to":to,"sha256":sha256}))?;
+        }
+        Command::Delete { id } => {
+            let receipt = vault::delete(&vault()?, id)?;
+            emit(json!({"event":"deleted","receipt":receipt}))?;
         }
     }
     Ok(0)

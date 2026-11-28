@@ -11,29 +11,39 @@
   <aside class="rail">
     <div class="brand"><img src="data:image/png;base64,APP_ICON_BASE64" alt=""><div><strong>LarchScan</strong><small>Windows security tools</small></div></div>
     <nav aria-label="Workspace">
-      <button data-page="overview" aria-current="page"><span class="nav-icon i-overview" aria-hidden="true"></span>Overview</button>
-      <button data-page="scans"><span class="nav-icon i-scan" aria-hidden="true"></span>Scan results</button>
-      <button data-page="vault"><span class="nav-icon i-vault" aria-hidden="true"></span>Quarantine</button>
-      <button data-page="history"><span class="nav-icon i-history" aria-hidden="true"></span>Scan history</button>
-      <button data-page="settings"><span class="nav-icon i-settings" aria-hidden="true"></span>Settings</button>
+      <button data-page="overview" aria-current="page"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="11" y="3" width="6" height="6" rx="1.5"/><rect x="3" y="11" width="6" height="6" rx="1.5"/><rect x="11" y="11" width="6" height="6" rx="1.5"/></svg>Overview</button>
+      <button data-page="scans"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10" cy="10" r="6.8"/><circle cx="10" cy="10" r="2.6"/><path d="M10 3.2V5.4M10 14.6V16.8M3.2 10H5.4M14.6 10H16.8" stroke-linecap="round"/></svg>Scan results</button>
+      <button data-page="vault"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M10 2.6L16.2 5.1V9.7C16.2 13.6 13.6 16.4 10 17.6C6.4 16.4 3.8 13.6 3.8 9.7V5.1L10 2.6Z" stroke-linejoin="round"/><path d="M7.6 10.1L9.3 11.8L12.6 8.3" stroke-linecap="round" stroke-linejoin="round"/></svg>Quarantine</button>
+      <button data-page="history"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10" cy="10" r="6.8"/><path d="M10 6.2V10L12.8 11.8" stroke-linecap="round" stroke-linejoin="round"/></svg>Scan history</button>
+      <button data-page="settings"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10" cy="10" r="2.7"/><path d="M10 3.1V5M10 15V16.9M3.1 10H5M15 10H16.9M5.1 5.1L6.5 6.5M13.5 13.5L14.9 14.9M14.9 5.1L13.5 6.5M6.5 13.5L5.1 14.9" stroke-linecap="round"/></svg>Settings</button>
     </nav>
     <div class="rail-footer"><span></span> Local workspace</div>
   </aside>
   <main id="workspace">
     <header class="topbar"><span id="section-label">Overview</span><span class="mode" id="mode"><i></i> On-demand scanner</span></header>
+    <div id="live-bar" class="live-bar" hidden>
+      <div class="live-copy"><strong id="live-scope">Scanning</strong><span id="live-meta">Starting…</span></div>
+      <div class="actions">
+        <button class="secondary" id="live-view" data-page="scans">View</button>
+        <button class="secondary" id="live-stop" data-action="cancel">Stop scan</button>
+      </div>
+    </div>
     <div id="toast" role="status" hidden></div>
     <section id="overview" class="page">
       <div class="hero">
         <img class="hero-mark" src="data:image/png;base64,APP_ICON_BASE64" alt="">
         <div class="hero-copy"><p class="eyebrow">FILE SECURITY</p><h1>Inspect your files</h1>
-        <p>Check a file or folder for known fingerprints and suspicious filenames. Review each finding before you quarantine anything.</p>
-        <button class="primary scan-action" data-action="quick">Start quick scan <span aria-hidden="true">→</span></button></div>
+        <p>Run a quick scan of Downloads and Desktop, or inspect any file, folder, or drive. Review every finding before you quarantine anything.</p>
+        <div class="hero-actions">
+          <button class="primary scan-action" data-action="quick">Start quick scan <span aria-hidden="true">→</span></button>
+          <span class="hero-note" id="overview-schedule" hidden></span>
+        </div></div>
       </div>
       <div class="section-head"><h2>Scan options</h2><span id="scan-options-note">Choose what to inspect</span></div>
       <div class="scan-grid">
-        <article class="card scan-card"><span class="tile-icon i-file" aria-hidden="true"></span><h3>Single file</h3><p>Check a specific download or document.</p><button class="secondary scan-action" data-action="pick_file">Choose file</button></article>
-        <article class="card scan-card"><span class="tile-icon i-folder" aria-hidden="true"></span><h3>Folder scan</h3><p>Inspect files in a folder and its subfolders.</p><button class="secondary scan-action" data-action="pick_folder">Choose folder</button></article>
-        <article class="card scan-card"><span class="tile-icon i-drive" aria-hidden="true"></span><h3>System drive</h3><p>Scan accessible files on the Windows drive.</p><button class="secondary scan-action" data-action="deep">Scan system drive</button></article>
+        <article class="card scan-card"><span class="tile-icon" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M5.5 2.8H11.6L15.2 6.4V17.2H5.5V2.8Z" stroke-linejoin="round"/><path d="M11.4 2.8V6.6H15.2" stroke-linejoin="round"/></svg></span><h3>Single file</h3><p>Check a specific download or document.</p><button class="secondary scan-action" data-action="pick_file">Choose file</button></article>
+        <article class="card scan-card"><span class="tile-icon" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 5.5C3 4.7 3.7 4 4.5 4H8.3L9.8 5.8H15.5C16.3 5.8 17 6.5 17 7.3V14.5C17 15.3 16.3 16 15.5 16H4.5C3.7 16 3 15.3 3 14.5V5.5Z" stroke-linejoin="round"/></svg></span><h3>Folder scan</h3><p>Inspect files in a folder and its subfolders.</p><button class="secondary scan-action" data-action="pick_folder">Choose folder</button></article>
+        <article class="card scan-card"><span class="tile-icon" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4.5" width="14" height="11" rx="2"/><path d="M3 11.5H17"/><circle cx="13.5" cy="13.5" r=".8" fill="currentColor" stroke="none"/></svg></span><h3>System drive</h3><p>Scan accessible files on the Windows drive.</p><button class="secondary scan-action" data-action="deep">Scan system drive</button></article>
       </div>
       <div class="section-head"><h2>Recent activity</h2><button class="text-button" data-page="history">View history <span aria-hidden="true">→</span></button></div>
       <div id="recent" class="card"></div>
@@ -41,27 +51,36 @@
     <section id="scans" class="page" hidden>
       <div class="page-title"><h1>Scan results</h1><p id="result-subtitle">Review findings and files that could not be checked.</p></div>
       <div id="progress" class="card progress-card" hidden><div class="row-between"><strong id="scan-scope">Scanning</strong><button class="secondary" id="cancel" data-action="cancel">Stop scan</button></div><progress aria-label="File scan in progress"></progress><p id="current-file"></p></div>
-      <div class="stat-grid"><div class="card stat"><span>Files scanned</span><strong id="count-files">0</strong></div><div class="card stat"><span>With findings</span><strong id="count-findings">0</strong></div><div class="card stat"><span>Incomplete checks</span><strong id="count-incomplete">0</strong></div></div>
-      <div class="section-head"><div class="tabs"><button class="selected" data-tab="findings">Findings</button><button data-tab="skipped">Skipped and incomplete</button></div><button class="secondary" id="export" hidden>Export report</button></div>
+      <div class="stat-grid"><div class="card stat"><span>Files scanned</span><strong id="count-files">0</strong></div><div class="card stat" id="stat-findings"><span>With findings</span><strong id="count-findings">0</strong></div><div class="card stat" id="stat-incomplete"><span>Incomplete checks</span><strong id="count-incomplete">0</strong></div></div>
+      <div class="section-head results-toolbar">
+        <div class="tabs"><button class="selected" data-tab="findings">Findings</button><button data-tab="skipped">Skipped and incomplete</button></div>
+        <div class="actions">
+          <input id="filter-input" class="filter-input" type="search" placeholder="Filter by file, path, or rule…" aria-label="Filter scan results">
+          <button class="secondary" id="export" hidden>Export report</button>
+        </div>
+      </div>
       <div id="findings" class="card"></div><div id="skipped" class="card" hidden></div>
     </section>
     <section id="vault" class="page" hidden>
-      <div class="page-title"><h1>Quarantine</h1><p>Review archived files and restore their verified contents to a new location.</p></div>
+      <div class="page-title"><h1>Quarantine</h1><p>Review archived files, see why each was flagged, restore verified bytes, or delete archives permanently.</p></div>
+      <div id="vault-warnings" class="card warning-card" hidden></div>
       <div class="section-head"><h2>Archived files</h2><button class="secondary" data-action="vault">Refresh</button></div>
       <div id="archives" class="card"><p class="empty">Reading the quarantine vault…</p></div>
     </section>
     <section id="history" class="page" hidden>
-      <div class="page-title"><h1>Scan history</h1><p>Open a saved report to review scan results or export them as JSON.</p></div>
+      <div class="page-title"><h1>Scan history</h1><p>Open a saved report to review scan results, export them as JSON, or remove old entries.</p></div>
+      <div class="section-head"><h2>Saved reports</h2><button class="secondary danger" id="clear-history" data-action="clear_history" hidden>Clear history</button></div>
       <div id="history-rows" class="card"></div>
     </section>
     <section id="settings" class="page" hidden>
       <div class="page-title"><h1>Settings</h1><p>Control how LarchScan runs checks on this PC.</p></div>
       <div class="card settings">
-        <div class="setting"><div><h3>Windows antimalware provider</h3><p>Submit file contents to the installed provider through AMSI. Its privacy and network settings apply.</p></div><label class="switch"><input id="amsi" type="checkbox" aria-label="Enable Windows antimalware provider"><span></span></label></div>
-        <div class="setting"><div><h3>Scheduled quick scan</h3><p>Scan Downloads and Desktop at an interval while LarchScan stays open.</p></div><select id="schedule" aria-label="Scheduled quick scan interval"><option value="0">Off</option><option value="30">Every 30 minutes</option><option value="60">Every hour</option><option value="240">Every 4 hours</option><option value="1440">Every 24 hours</option></select></div>
+        <div class="setting"><div><h3>Windows antimalware provider</h3><p>Submit non-empty file contents to the installed provider through AMSI. Its privacy and network settings apply.</p></div><label class="switch"><input id="amsi" type="checkbox" aria-label="Enable Windows antimalware provider"><span></span></label></div>
+        <div class="setting"><div><h3>Scheduled quick scan</h3><p>Scan Downloads and Desktop at an interval while LarchScan stays open.</p><p class="subnote" id="schedule-next" hidden></p></div><select id="schedule" aria-label="Scheduled quick scan interval"><option value="0">Off</option><option value="30">Every 30 minutes</option><option value="60">Every hour</option><option value="240">Every 4 hours</option><option value="1440">Every 24 hours</option></select></div>
         <div class="setting"><div><h3>Custom fingerprint rules</h3><p id="rule-file">No custom rule file selected.</p></div><div class="actions"><button class="secondary" id="clear-rules" data-action="clear_rules" hidden>Remove</button><button class="secondary" data-action="pick_rules">Choose JSON</button></div></div>
+        <div class="setting"><div><h3>Local data folder</h3><p id="data-dir">Reports, settings, and quarantine records are stored locally.</p></div><button class="secondary" data-action="open_data_dir">Open folder</button></div>
       </div>
-      <p class="footnote">Rules, reports and quarantine records are stored locally. Scans cover local files up to 32 MiB.</p>
+      <p class="footnote">Rules, reports, and quarantine records are stored locally. Up to 100 recent reports are kept automatically. Default file size limit is 32 MiB.</p>
     </section>
   </main>
   <script>/* APP_JS */</script>

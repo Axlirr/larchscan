@@ -1,9 +1,13 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
+use uuid::Uuid;
+use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 const DEMO: &[u8] = include_bytes!("../examples/demo.txt");
 const HASH: &str = "3d4d3fb8ab38ddc7a54e0eebcd574e7b4d74419d7877e206c86e9b688b8ebe8b";
@@ -92,6 +96,7 @@ fn quarantine_list_and_restore_bytes_without_clobbering() {
     let id = lab.archive();
     let items = records(lab.run(&["list".as_ref()], 0));
     assert_eq!(items[0]["receipt"]["id"], id);
+    assert!(items[0]["receipt"]["quarantined_at"].as_u64().is_some());
     fs::write(&lab.file, b"replacement").unwrap();
     lab.restore(&id, &lab.file, 2);
     assert_eq!(fs::read(&lab.file).unwrap(), b"replacement");
@@ -104,6 +109,87 @@ fn quarantine_list_and_restore_bytes_without_clobbering() {
             .contains("ZoneId=3")
     );
     assert_eq!(records(lab.run(&["list".as_ref()], 0)).len(), 1);
+}
+
+#[test]
+fn zone_identifier_is_preserved_across_quarantine_restore_and_requarantine() {
+    let lab = Lab::new();
+    let zone = "[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.invalid/demo.txt\r\n";
+    fs::write(format!("{}:Zone.Identifier", lab.file.display()), zone).unwrap();
+
+    let id = lab.archive();
+    let restored = lab.root.path().join("restored-motw.txt");
+    lab.restore(&id, &restored, 0);
+    assert_eq!(fs::read(&restored).unwrap(), DEMO);
+    let restored_zone =
+        fs::read_to_string(format!("{}:Zone.Identifier", restored.display())).unwrap();
+    assert_eq!(restored_zone, zone);
+
+    // Restored files carry Zone.Identifier and can be re-quarantined cleanly.
+    let second = lab.run(
+        &[
+            "quarantine".as_ref(),
+            restored.as_os_str(),
+            "--expect".as_ref(),
+            HASH.as_ref(),
+        ],
+        0,
+    );
+    let second_receipt: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(!restored.exists());
+    assert!(
+        second_receipt["receipt"]["zone_identifier_b64"]
+            .as_str()
+            .is_some()
+    );
+}
+
+#[test]
+fn legacy_v1_archive_can_still_be_listed_and_restored() {
+    let lab = Lab::new();
+    let vault = lab.root.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    let id = Uuid::new_v4();
+    let header = json!({
+        "format": "larchscan/1",
+        "id": id,
+        "original": lab.file,
+        "sha256": HASH,
+        "bytes": DEMO.len(),
+        "findings": [{"id": "demo.fixture", "reason": "legacy fixture"}]
+    });
+    let archive_content = format!("{header}\n{}", STANDARD.encode(DEMO));
+    fs::write(vault.join(format!("{id}.lsq")), archive_content).unwrap();
+
+    let items = records(lab.run(&["list".as_ref()], 0));
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["receipt"]["id"], id.to_string());
+
+    let restored = lab.root.path().join("legacy-restored.txt");
+    lab.restore(&id.to_string(), &restored, 0);
+    assert_eq!(fs::read(&restored).unwrap(), DEMO);
+}
+
+#[test]
+fn delete_removes_archive_and_corrupt_lsq_does_not_break_healthy_items() {
+    let lab = Lab::new();
+    let id = lab.archive();
+    fs::write(lab.root.path().join("vault").join("corrupt.lsq"), b"broken").unwrap();
+
+    let list_out = lab.run(&["list".as_ref()], 0);
+    let stderr = String::from_utf8_lossy(&list_out.stderr);
+    assert!(stderr.contains("warning: skipped"));
+    let items = records(list_out);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["receipt"]["id"], id);
+
+    let del_out = lab.run(&["delete".as_ref(), id.as_ref()], 0);
+    let deleted: Value = serde_json::from_slice(&del_out.stdout).unwrap();
+    assert_eq!(deleted["event"], "deleted");
+    assert_eq!(deleted["receipt"]["id"], id);
+
+    assert!(records(lab.run(&["list".as_ref()], 0)).is_empty());
+    lab.run(&["delete".as_ref(), id.as_ref()], 2);
 }
 
 #[test]
@@ -156,6 +242,47 @@ fn large_or_missing_input_reports_incomplete_coverage() {
 }
 
 #[test]
+fn scan_supports_exclude_and_readwrite_shared_files() {
+    let lab = Lab::new();
+    let skipped_dir = lab.root.path().join("ignored");
+    fs::create_dir(&skipped_dir).unwrap();
+    fs::write(skipped_dir.join("demo-copy.txt"), DEMO).unwrap();
+
+    let active = lab.root.path().join("active.log");
+    let _writer = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&active)
+        .unwrap();
+
+    let events = records(lab.run(
+        &[
+            "scan".as_ref(),
+            lab.root.path().as_os_str(),
+            "--exclude".as_ref(),
+            skipped_dir.as_os_str(),
+        ],
+        1,
+    ));
+    let summary = events.last().unwrap();
+    assert_eq!(summary["files_scanned"], 2);
+    assert_eq!(summary["files_with_findings"], 1);
+    assert_eq!(summary["incomplete"], 0);
+}
+
+#[test]
+fn empty_file_with_amsi_does_not_report_provider_error() {
+    let lab = Lab::new();
+    let empty = lab.root.path().join("empty.txt");
+    fs::write(&empty, b"").unwrap();
+    let events = records(lab.run(&["scan".as_ref(), empty.as_os_str(), "--amsi".as_ref()], 0));
+    assert_eq!(events[0]["verdict"]["provider_error"], Value::Null);
+    assert_eq!(events[1]["incomplete"], 0);
+}
+
+#[test]
 fn custom_rules_and_invalid_digests() {
     let lab = Lab::new();
     fs::write(&lab.file, b"abc").unwrap();
@@ -178,15 +305,33 @@ fn custom_rules_and_invalid_digests() {
 }
 
 #[test]
-fn document_named_executable_has_a_reviewable_finding() {
+fn document_named_executable_and_script_double_extensions_are_flagged() {
     let lab = Lab::new();
-    let disguised = lab.root.path().join("report.pdf.exe");
-    fs::copy(env!("CARGO_BIN_EXE_larchscan"), &disguised).unwrap();
-    let events = records(lab.run(&["scan".as_ref(), disguised.as_os_str()], 1));
+    let pe_cases = [
+        "report.pdf.exe",
+        "invoice.pdf .exe",
+        "deck.pptx",
+        "receipt.jpg.com",
+    ];
+    for name in pe_cases {
+        let disguised = lab.root.path().join(name);
+        fs::copy(env!("CARGO_BIN_EXE_larchscan"), &disguised).unwrap();
+        let events = records(lab.run(&["scan".as_ref(), disguised.as_os_str()], 1));
+        assert_eq!(
+            events[0]["verdict"]["findings"][0]["id"], "triage.document-named-pe",
+            "expected finding for {name}"
+        );
+    }
+
+    let script = lab.root.path().join("statement.docx .ps1");
+    fs::write(&script, b"Write-Host 'test'").unwrap();
+    let script_events = records(lab.run(&["scan".as_ref(), script.as_os_str()], 1));
     assert_eq!(
-        events[0]["verdict"]["findings"][0]["id"],
-        "triage.document-named-pe"
+        script_events[0]["verdict"]["findings"][0]["id"],
+        "triage.double-extension-script"
     );
-    fs::write(&disguised, b"MZ just a text fixture").unwrap();
-    lab.run(&["scan".as_ref(), disguised.as_os_str()], 0);
+
+    let benign = lab.root.path().join("report.pdf.exe");
+    fs::write(&benign, b"MZ just a text fixture").unwrap();
+    lab.run(&["scan".as_ref(), benign.as_os_str()], 0);
 }

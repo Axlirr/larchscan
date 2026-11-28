@@ -1,10 +1,11 @@
-use crate::windows::{Amsi, regular_file};
+use crate::windows::{Amsi, disk_path, paths_equal, regular_file};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -14,17 +15,48 @@ use windows_sys::Win32::System::Antimalware::{
 };
 
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
+const READ_CHUNK: usize = 64 * 1024;
+
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
 pub fn read_bytes(file: &File) -> Result<Vec<u8>> {
+    read_bytes_with_limit(file, MAX_BYTES, || false)?
+        .ok_or_else(|| anyhow::anyhow!("scan cancelled"))
+}
+
+pub fn read_bytes_with_limit(
+    file: &File,
+    max_bytes: usize,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<Vec<u8>>> {
     let len = file.metadata()?.len();
-    ensure!(len <= MAX_BYTES as u64, "file exceeds 32 MiB limit");
-    let mut bytes = Vec::with_capacity(len as usize);
-    file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() == len as usize, "file changed during read");
-    Ok(bytes)
+    if len > max_bytes as u64 {
+        if max_bytes == MAX_BYTES {
+            anyhow::bail!("file exceeds 32 MiB limit");
+        }
+        anyhow::bail!("file exceeds {} MiB limit", max_bytes.div_ceil(1024 * 1024));
+    }
+    let expected = len as usize;
+    let mut bytes = Vec::with_capacity(expected);
+    let mut reader = file.take(max_bytes as u64 + 1);
+    let mut chunk = [0u8; READ_CHUNK];
+    loop {
+        if cancelled() {
+            return Ok(None);
+        }
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        if bytes.len() > max_bytes {
+            anyhow::bail!("file grew beyond size limit during read");
+        }
+    }
+    ensure!(bytes.len() == expected, "file changed during read");
+    Ok(Some(bytes))
 }
 
 #[derive(Deserialize)]
@@ -35,7 +67,7 @@ struct Rule {
     reason: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Finding {
     pub id: String,
     pub reason: String,
@@ -46,28 +78,95 @@ pub struct Engine {
     amsi: Option<Amsi>,
 }
 
+fn is_document_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "pdf"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "rtf"
+            | "csv"
+            | "odt"
+            | "ods"
+            | "txt"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "bmp"
+            | "webp"
+            | "svg"
+            | "mp3"
+            | "mp4"
+            | "zip"
+            | "rar"
+            | "7z"
+            | "html"
+            | "htm"
+            | "eml"
+            | "msg"
+    )
+}
+
 fn document_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(is_document_ext)
+}
+
+fn trimmed_stem_has_document_extension(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let trimmed = stem.trim_end_matches([' ', '.']);
+    document_extension(Path::new(trimmed))
+}
+
+fn pe_launcher_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|s| s.to_str())
         .is_some_and(|ext| {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "pdf" | "doc" | "docx" | "xls" | "xlsx" | "txt" | "jpg" | "jpeg" | "png"
+                "exe" | "scr" | "com" | "pif" | "cpl" | "dll" | "ocx"
             )
         })
 }
 
-fn document_named_pe(path: &Path, bytes: &[u8]) -> bool {
-    let double_extension = path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("scr"))
-        && path
-            .file_stem()
-            .is_some_and(|stem| document_extension(Path::new(stem)));
-    if !(document_extension(path) || double_extension)
-        || !bytes.starts_with(b"MZ")
-        || bytes.len() < 64
-    {
+fn script_launcher_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "lnk"
+                    | "bat"
+                    | "cmd"
+                    | "ps1"
+                    | "vbs"
+                    | "vbe"
+                    | "js"
+                    | "jse"
+                    | "wsf"
+                    | "hta"
+                    | "msi"
+            )
+        })
+}
+
+fn has_bidi_override(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name.encode_wide()
+            .any(|unit| matches!(unit, 0x202A..=0x202E | 0x2066..=0x2069))
+    })
+}
+
+fn is_valid_pe(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"MZ") || bytes.len() < 64 {
         return false;
     }
     let offset = u32::from_le_bytes(bytes[60..64].try_into().expect("four-byte offset")) as usize;
@@ -76,13 +175,28 @@ fn document_named_pe(path: &Path, bytes: &[u8]) -> bool {
     };
     let optional_len = u16::from_le_bytes([header[20], header[21]]) as usize;
     let sections = u16::from_le_bytes([header[6], header[7]]) as usize;
-    offset >= 64
+    let Some(required_len) = 24usize
+        .checked_add(optional_len)
+        .and_then(|n| n.checked_add(sections.checked_mul(40)?))
+    else {
+        return false;
+    };
+    offset >= 4
         && header.starts_with(b"PE\0\0")
-        && (1..=96).contains(&sections)
+        && sections >= 1
         && (header[22] & 2) != 0
         && optional_len >= 2
-        && header.len() >= 24 + optional_len + sections * 40
+        && header.len() >= required_len
         && matches!(u16::from_le_bytes([header[24], header[25]]), 0x10b | 0x20b)
+}
+
+fn document_named_pe(path: &Path, bytes: &[u8]) -> bool {
+    let double_extension = pe_launcher_extension(path) && trimmed_stem_has_document_extension(path);
+    (document_extension(path) || double_extension) && is_valid_pe(bytes)
+}
+
+fn double_extension_script(path: &Path) -> bool {
+    script_launcher_extension(path) && trimmed_stem_has_document_extension(path)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -150,9 +264,23 @@ impl Engine {
                 reason: "Windows executable headers and a document or image filename; review the file type".into(),
             });
         }
+        if double_extension_script(path) {
+            findings.push(Finding {
+                id: "triage.double-extension-script".into(),
+                reason: "Document or image name paired with a Windows script or shortcut extension; review before opening".into(),
+            });
+        }
+        if has_bidi_override(path) {
+            findings.push(Finding {
+                id: "triage.bidi-filename".into(),
+                reason: "Filename contains Unicode bidirectional control characters that can disguise the true extension".into(),
+            });
+        }
         let mut provider_error = None;
         let mut amsi_result = None;
-        if let Some(provider) = &self.amsi {
+        if let Some(provider) = &self.amsi
+            && !bytes.is_empty()
+        {
             match provider.scan(path, bytes) {
                 Ok(value) => {
                     amsi_result = Some(value);
@@ -224,13 +352,28 @@ pub enum ScanEvent {
     },
 }
 
+#[derive(Clone, Debug)]
+pub struct ScanOptions {
+    pub max_bytes: usize,
+    pub exclude: Vec<PathBuf>,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_BYTES,
+            exclude: Vec::new(),
+        }
+    }
+}
+
 pub fn tree(
     engine: &Engine,
     root: &Path,
     cancelled: impl Fn() -> bool,
     emit: impl FnMut(ScanEvent) -> Result<()>,
 ) -> Result<Summary> {
-    tree_excluding(engine, root, None, cancelled, emit)
+    tree_with_options(engine, root, &ScanOptions::default(), cancelled, emit)
 }
 
 pub fn tree_excluding(
@@ -238,9 +381,28 @@ pub fn tree_excluding(
     root: &Path,
     exclude: Option<&Path>,
     cancelled: impl Fn() -> bool,
+    emit: impl FnMut(ScanEvent) -> Result<()>,
+) -> Result<Summary> {
+    let options = ScanOptions {
+        exclude: exclude.into_iter().map(Path::to_path_buf).collect(),
+        ..ScanOptions::default()
+    };
+    tree_with_options(engine, root, &options, cancelled, emit)
+}
+
+pub fn tree_with_options(
+    engine: &Engine,
+    root: &Path,
+    options: &ScanOptions,
+    cancelled: impl Fn() -> bool,
     mut emit: impl FnMut(ScanEvent) -> Result<()>,
 ) -> Result<Summary> {
-    let root = crate::windows::disk_path(root)?;
+    let root = disk_path(root)?;
+    let excluded: Vec<PathBuf> = options
+        .exclude
+        .iter()
+        .filter_map(|p| disk_path(p).ok())
+        .collect();
     let mut summary = Summary::default();
     let mut iter = WalkDir::new(&root)
         .follow_links(false)
@@ -264,16 +426,21 @@ pub fn tree_excluding(
             }
         };
         let path = entry.path();
-        if exclude.is_some_and(|folder| {
-            path.ancestors()
-                .any(|part| part.as_os_str().eq_ignore_ascii_case(folder.as_os_str()))
-        }) {
+        if excluded
+            .iter()
+            .any(|folder| path.ancestors().any(|part| paths_equal(part, folder)))
+        {
             if entry.file_type().is_dir() {
                 iter.skip_current_dir();
             }
             continue;
         }
-        let result: Result<Option<Verdict>> = (|| {
+        enum FileOutcome {
+            Scanned(Verdict),
+            SkippedDir,
+            Cancelled,
+        }
+        let result: Result<FileOutcome> = (|| {
             let metadata = std::fs::symlink_metadata(path)?;
             if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 if entry.file_type().is_dir() {
@@ -282,13 +449,16 @@ pub fn tree_excluding(
                 anyhow::bail!("reparse point excluded");
             }
             if metadata.is_dir() {
-                return Ok(None);
+                return Ok(FileOutcome::SkippedDir);
             }
-            let bytes = read_bytes(&regular_file(path, false)?)?;
-            Ok(Some(engine.inspect(path, &bytes)))
+            let file = regular_file(path, false)?;
+            let Some(bytes) = read_bytes_with_limit(&file, options.max_bytes, &cancelled)? else {
+                return Ok(FileOutcome::Cancelled);
+            };
+            Ok(FileOutcome::Scanned(engine.inspect(path, &bytes)))
         })();
         match result {
-            Ok(Some(verdict)) => {
+            Ok(FileOutcome::Scanned(verdict)) => {
                 summary.files_scanned += 1;
                 summary.files_with_findings += u64::from(!verdict.findings.is_empty());
                 summary.incomplete += u64::from(verdict.provider_error.is_some());
@@ -297,7 +467,11 @@ pub fn tree_excluding(
                     verdict,
                 })?;
             }
-            Ok(None) => (),
+            Ok(FileOutcome::SkippedDir) => (),
+            Ok(FileOutcome::Cancelled) => {
+                summary.cancelled = true;
+                break;
+            }
             Err(error) => {
                 summary.incomplete += 1;
                 emit(ScanEvent::Unscanned {

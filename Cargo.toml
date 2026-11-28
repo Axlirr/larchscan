@@ -1,6 +1,6 @@
 [package]
 name = "larchscan"
-version = "0.2.0"
+version = "0.3.0"
 default-run = "larchscan"
 edition = "2024"
 rust-version = "1.89"
@@ -30,3 +30,8 @@ desktop = ["dep:tao", "dep:wry", "dep:rfd"]
 name = "larchscan-desktop"
 path = "src/desktop/main.rs"
 required-features = ["desktop"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

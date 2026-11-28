@@ -11,8 +11,10 @@ use larchscan::{
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -23,12 +25,16 @@ use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
-    window::{Window, WindowBuilder},
+    window::{Icon, Window, WindowBuilder},
 };
 use uuid::Uuid;
 use wry::{WebContext, WebView, WebViewBuilder};
 
 #[derive(Parser)]
+#[command(
+    version,
+    about = "LarchScan explainable Windows file triage and reversible quarantine"
+)]
 struct Launch {
     /// Open LarchScan and scan this file or folder.
     #[arg(long)]
@@ -39,14 +45,20 @@ const SAVED_ROWS: usize = 300;
 const HTML: &str = include_str!("window.html");
 const CSS: &str = include_str!("window.css");
 const JS: &str = include_str!("window.js");
+const ICON_RGBA: &[u8] = include_bytes!("../../assets/icon-32x32.rgba");
 const UI_URL: &str = "http://larchscan.localhost/index.html";
 
 enum Message {
     Request(String),
     Update(Value),
     Finished(Box<Report>),
+    VaultLoaded(Result<vault::ListReport>),
+    HistoryLoaded(Result<Vec<Value>>),
+    AmsiChecked { enabled: bool, result: Result<()> },
+    RulesChecked { path: PathBuf, result: Result<()> },
     Restored(Result<PathBuf>),
     Quarantined(Result<vault::Receipt>),
+    DeletedArchive(Result<vault::Receipt>),
 }
 
 #[derive(Deserialize)]
@@ -61,6 +73,8 @@ enum Request {
     Vault,
     History,
     OpenReport { id: Uuid },
+    DeleteReport { id: Uuid },
+    ClearHistory,
     Export { id: Uuid },
     SetAmsi { enabled: bool },
     SetSchedule { minutes: u64 },
@@ -68,6 +82,9 @@ enum Request {
     ClearRules,
     Quarantine { id: Uuid, index: usize },
     Restore { id: Uuid },
+    DeleteArchive { id: Uuid },
+    RevealInExplorer { path: String },
+    OpenDataDir,
 }
 
 struct App {
@@ -77,7 +94,9 @@ struct App {
     settings: Settings,
     scan: Option<Arc<AtomicBool>>,
     vault_busy: bool,
+    settings_busy: bool,
     next_scan: Option<Instant>,
+    next_scan_epoch: Option<u64>,
     proxy: EventLoopProxy<Message>,
 }
 
@@ -113,7 +132,9 @@ impl App {
             settings,
             scan: None,
             vault_busy: false,
+            settings_busy: false,
             next_scan: None,
+            next_scan_epoch: None,
             proxy,
         };
         app.reset_schedule();
@@ -121,12 +142,34 @@ impl App {
     }
 
     fn reset_schedule(&mut self) {
-        self.next_scan = match self.settings.schedule_minutes {
+        match self.settings.schedule_minutes {
             minutes @ (30 | 60 | 240 | 1440) => {
-                Some(Instant::now() + Duration::from_secs(minutes * 60))
+                let delta = Duration::from_secs(minutes * 60);
+                self.next_scan = Some(Instant::now() + delta);
+                self.next_scan_epoch = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|now| now.as_secs() + minutes * 60);
             }
-            _ => None,
-        };
+            _ => {
+                self.next_scan = None;
+                self.next_scan_epoch = None;
+            }
+        }
+    }
+
+    fn settings_payload(&self) -> Value {
+        json!({
+            "amsi": self.settings.amsi,
+            "rules": self.settings.rules,
+            "schedule_minutes": self.settings.schedule_minutes,
+            "next_scan_epoch": self.next_scan_epoch,
+            "data_dir": self.root.to_string_lossy()
+        })
+    }
+
+    fn send_settings(&self, web: &WebView) {
+        send(web, "settings", self.settings_payload());
     }
 
     fn save_settings(&mut self, updated: Settings, web: &WebView) -> Result<()> {
@@ -136,13 +179,29 @@ impl App {
         if schedule_changed {
             self.reset_schedule();
         }
-        send(web, "settings", &self.settings);
+        self.send_settings(web);
         send(web, "notice", "Settings saved");
         Ok(())
     }
 
     fn report_file(&self, id: Uuid) -> PathBuf {
         self.history.join(format!("{id}.json"))
+    }
+
+    fn load_history_async(&self) {
+        let dir = self.history.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(Message::HistoryLoaded(storage::history(&dir)));
+        });
+    }
+
+    fn load_vault_async(&self) {
+        let dir = self.vault.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(Message::VaultLoaded(vault::list_with_warnings(&dir)));
+        });
     }
 
     fn quick(&mut self, scheduled: bool, web: &WebView) -> Result<()> {
@@ -158,11 +217,18 @@ impl App {
                 "Quick scan"
             },
             paths,
+            scheduled,
             web,
         )
     }
 
-    fn start(&mut self, scope: &str, paths: Vec<PathBuf>, web: &WebView) -> Result<()> {
+    fn start(
+        &mut self,
+        scope: &str,
+        paths: Vec<PathBuf>,
+        scheduled: bool,
+        web: &WebView,
+    ) -> Result<()> {
         ensure!(
             self.scan.is_none() && !self.vault_busy,
             "wait for the active operation"
@@ -191,15 +257,20 @@ impl App {
                 run_scan(report, paths, &private_root, &cancellation, proxy);
             })?;
         self.scan = Some(cancel);
-        send(web, "started", scope);
+        send(
+            web,
+            "started",
+            json!({"scope": scope, "scheduled": scheduled}),
+        );
         Ok(())
     }
 
     fn handle(&mut self, request: Request, window: &Window, web: &WebView) -> Result<()> {
         match request {
             Request::Ready => {
-                send(web, "settings", &self.settings);
-                send(web, "history", storage::history(&self.history)?);
+                self.send_settings(web);
+                self.load_history_async();
+                self.load_vault_async();
             }
             Request::Quick => self.quick(false, web)?,
             Request::Deep => {
@@ -208,6 +279,7 @@ impl App {
                 self.start(
                     "System drive scan",
                     vec![PathBuf::from(format!("{drive}\\"))],
+                    false,
                     web,
                 )?;
             }
@@ -227,6 +299,7 @@ impl App {
                     self.start(
                         if folder { "Folder scan" } else { "File scan" },
                         vec![path],
+                        false,
                         web,
                     )?;
                 }
@@ -236,13 +309,51 @@ impl App {
                     flag.store(true, Ordering::Relaxed);
                 }
             }
-            Request::Vault => send(web, "vault", vault::list(&self.vault)?),
-            Request::History => send(web, "history", storage::history(&self.history)?),
+            Request::Vault => self.load_vault_async(),
+            Request::History => self.load_history_async(),
             Request::OpenReport { id } => send(
                 web,
                 "report",
                 storage::read::<Report>(&self.report_file(id))?,
             ),
+            Request::DeleteReport { id } => {
+                let agreed = MessageDialog::new()
+                    .set_parent(window)
+                    .set_level(MessageLevel::Warning)
+                    .set_title("Delete scan report?")
+                    .set_description("Remove this saved scan report from local history?")
+                    .set_buttons(MessageButtons::OkCancel)
+                    .show()
+                    == MessageDialogResult::Ok;
+                if agreed {
+                    storage::delete_report(&self.history, id)?;
+                    send(web, "report_deleted", id);
+                    send(web, "notice", "Report removed from history");
+                    self.load_history_async();
+                }
+            }
+            Request::ClearHistory => {
+                let agreed = MessageDialog::new()
+                    .set_parent(window)
+                    .set_level(MessageLevel::Warning)
+                    .set_title("Clear scan history?")
+                    .set_description(
+                        "Delete all saved scan reports from local history? Quarantine archives are not affected.",
+                    )
+                    .set_buttons(MessageButtons::OkCancel)
+                    .show()
+                    == MessageDialogResult::Ok;
+                if agreed {
+                    let removed = storage::clear_history(&self.history)?;
+                    send(web, "history_cleared", removed);
+                    send(
+                        web,
+                        "notice",
+                        format!("Cleared {removed} saved scan report(s)"),
+                    );
+                    self.load_history_async();
+                }
+            }
             Request::Export { id } => {
                 let report = storage::read::<Report>(&self.report_file(id))?;
                 let suggested = format!("larchscan-report-{}.json", &id.to_string()[..8]);
@@ -252,19 +363,26 @@ impl App {
                     .add_filter("JSON report", &["json"])
                     .save_file()
                 {
-                    storage::write(&dest, &report, false)?;
+                    storage::write(&dest, &report, true)?;
                     send(web, "notice", "Report exported");
                 }
             }
             Request::SetAmsi { enabled } => {
+                ensure!(!self.settings_busy, "wait for settings check to finish");
                 if enabled {
-                    Engine::load(None, true)?;
+                    self.settings_busy = true;
+                    let proxy = self.proxy.clone();
+                    std::thread::spawn(move || {
+                        let result = Engine::load(None, true).map(|_| ());
+                        let _ = proxy.send_event(Message::AmsiChecked { enabled, result });
+                    });
+                } else {
+                    let updated = Settings {
+                        amsi: false,
+                        ..self.settings.clone()
+                    };
+                    self.save_settings(updated, web)?;
                 }
-                let updated = Settings {
-                    amsi: enabled,
-                    ..self.settings.clone()
-                };
-                self.save_settings(updated, web)?;
             }
             Request::SetSchedule { minutes } => {
                 ensure!(
@@ -277,22 +395,29 @@ impl App {
                 };
                 self.save_settings(updated, web)?;
             }
-            Request::PickRules | Request::ClearRules => {
-                let rules = if matches!(request, Request::PickRules) {
-                    let path = FileDialog::new()
-                        .set_parent(window)
-                        .add_filter("JSON rules", &["json"])
-                        .pick_file();
-                    let Some(path) = path else { return Ok(()) };
-                    Engine::load(Some(&path), false)
-                        .context("unable to load the selected rules")?;
-                    Some(path)
-                } else {
-                    None
+            Request::PickRules => {
+                ensure!(!self.settings_busy, "wait for settings check to finish");
+                let Some(path) = FileDialog::new()
+                    .set_parent(window)
+                    .add_filter("JSON rules", &["json"])
+                    .pick_file()
+                else {
+                    return Ok(());
                 };
+                self.settings_busy = true;
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    let result = Engine::load(Some(&path), false)
+                        .context("unable to load the selected rules")
+                        .map(|_| ());
+                    let _ = proxy.send_event(Message::RulesChecked { path, result });
+                });
+            }
+            Request::ClearRules => {
+                ensure!(!self.settings_busy, "wait for settings check to finish");
                 self.save_settings(
                     Settings {
-                        rules,
+                        rules: None,
                         ..self.settings.clone()
                     },
                     web,
@@ -342,10 +467,8 @@ impl App {
                     self.scan.is_none() && !self.vault_busy,
                     "wait for the active operation"
                 );
-                let item = vault::list(&self.vault)?
-                    .into_iter()
-                    .find(|item| item.id == id)
-                    .context("archive no longer available")?;
+                let item =
+                    vault::inspect(&self.vault, id).context("archive no longer available")?;
                 let name = item
                     .original
                     .file_name()
@@ -368,6 +491,51 @@ impl App {
                 self.vault_busy = true;
                 send(web, "vault_busy", true);
             }
+            Request::DeleteArchive { id } => {
+                ensure!(
+                    self.scan.is_none() && !self.vault_busy,
+                    "wait for the active operation"
+                );
+                let item =
+                    vault::inspect(&self.vault, id).context("archive no longer available")?;
+                let agreed = MessageDialog::new()
+                    .set_parent(window)
+                    .set_level(MessageLevel::Warning)
+                    .set_title("Delete archived file permanently?")
+                    .set_description(format!(
+                        "Permanently delete this quarantine archive? It cannot be restored afterward.\n\n{}",
+                        item.original.display()
+                    ))
+                    .set_buttons(MessageButtons::OkCancel)
+                    .show()
+                    == MessageDialogResult::Ok;
+                if agreed {
+                    let proxy = self.proxy.clone();
+                    let dir = self.vault.clone();
+                    std::thread::spawn(move || {
+                        let _ = proxy.send_event(Message::DeletedArchive(vault::delete(&dir, id)));
+                    });
+                    self.vault_busy = true;
+                    send(web, "vault_busy", true);
+                }
+            }
+            Request::RevealInExplorer { path } => {
+                let target = windows::disk_path(Path::new(&path))?;
+                ensure!(target.exists(), "file no longer exists at that location");
+                let mut arg = OsString::from("/select,");
+                arg.push(&target);
+                Command::new("explorer.exe")
+                    .arg(arg)
+                    .spawn()
+                    .context("could not open File Explorer")?;
+            }
+            Request::OpenDataDir => {
+                fs::create_dir_all(&self.root)?;
+                Command::new("explorer.exe")
+                    .arg(&self.root)
+                    .spawn()
+                    .context("could not open data folder")?;
+            }
         }
         Ok(())
     }
@@ -389,19 +557,20 @@ fn run_scan(
                 report.summary.cancelled = true;
                 break;
             }
-            let scope = scan::tree_excluding(
-                &engine,
-                &target,
-                Some(private_root),
-                stop,
-                |event| {
+            let scope =
+                scan::tree_excluding(&engine, &target, Some(private_root), stop, |event| {
                     let current = match event {
                         ScanEvent::File { path, verdict } => {
                             report.summary.files_scanned += 1;
                             if !verdict.findings.is_empty() {
                                 report.summary.files_with_findings += 1;
                                 if report.findings.len() < SAVED_ROWS {
-                                    report.findings.push(json!({"path":path.to_string_lossy(),"sha256":verdict.sha256,"rules":verdict.findings}));
+                                    report.findings.push(json!({
+                                        "path": path.to_string_lossy(),
+                                        "sha256": verdict.sha256,
+                                        "rules": verdict.findings,
+                                        "amsi_result": verdict.amsi_result
+                                    }));
                                 }
                             }
                             if let Some(error) = verdict.provider_error {
@@ -432,8 +601,7 @@ fn run_scan(
                         ));
                     }
                     Ok(())
-                },
-            )?;
+                })?;
             report.summary.cancelled |= scope.cancelled;
         }
         Ok(())
@@ -451,12 +619,30 @@ fn send(web: &WebView, event: &str, data: impl serde::Serialize) {
 }
 
 fn run() -> Result<()> {
-    let mut launch_scan = Launch::try_parse()?.scan;
+    let mut launch_scan = match Launch::try_parse() {
+        Ok(args) => args.scan,
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                MessageDialog::new()
+                    .set_title("LarchScan")
+                    .set_level(MessageLevel::Info)
+                    .set_description(error.to_string())
+                    .show();
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
     let events = EventLoopBuilder::<Message>::with_user_event().build();
     let proxy = events.create_proxy();
     let (mut app, settings_error) = App::new(proxy.clone())?;
+    let window_icon = Icon::from_rgba(ICON_RGBA.to_vec(), 32, 32).ok();
     let window = WindowBuilder::new()
         .with_title("LarchScan")
+        .with_window_icon(window_icon)
         .with_inner_size(LogicalSize::new(1180, 820))
         .with_min_inner_size(LogicalSize::new(760, 570))
         .build(&events)?;
@@ -498,6 +684,9 @@ fn run() -> Result<()> {
         .build(&window)?;
     let mut settings_error = settings_error;
     events.run(move |event, _, flow| {
+        if matches!(*flow, ControlFlow::Exit) {
+            return;
+        }
         *flow = app
             .next_scan
             .map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
@@ -536,7 +725,7 @@ fn run() -> Result<()> {
                 }
                 if ready
                     && let Some(path) = launch_scan.take()
-                    && let Err(error) = app.start("Custom scan", vec![path], &web)
+                    && let Err(error) = app.start("Custom scan", vec![path], false, &web)
                 {
                     send(&web, "error", format!("{error:#}"));
                 }
@@ -545,6 +734,9 @@ fn run() -> Result<()> {
             Event::UserEvent(Message::Finished(report)) => {
                 app.scan = None;
                 let saved = storage::write(&app.report_file(report.id), &report, false);
+                if saved.is_ok() {
+                    let _ = storage::prune_history(&app.history, storage::MAX_HISTORY);
+                }
                 send(
                     &web,
                     "finished",
@@ -556,15 +748,59 @@ fn run() -> Result<()> {
                         "error",
                         format!("Could not save the scan report. {error:#}"),
                     );
-                } else if let Ok(rows) = storage::history(&app.history) {
-                    send(&web, "history", rows);
+                } else {
+                    app.load_history_async();
+                }
+            }
+            Event::UserEvent(Message::VaultLoaded(result)) => match result {
+                Ok(report) => send(&web, "vault", report),
+                Err(error) => send(&web, "error", format!("{error:#}")),
+            },
+            Event::UserEvent(Message::HistoryLoaded(result)) => match result {
+                Ok(rows) => send(&web, "history", rows),
+                Err(error) => send(&web, "error", format!("{error:#}")),
+            },
+            Event::UserEvent(Message::AmsiChecked { enabled, result }) => {
+                app.settings_busy = false;
+                match result {
+                    Ok(()) => {
+                        let updated = Settings {
+                            amsi: enabled,
+                            ..app.settings.clone()
+                        };
+                        if let Err(error) = app.save_settings(updated, &web) {
+                            send(&web, "error", format!("{error:#}"));
+                        }
+                    }
+                    Err(error) => {
+                        app.send_settings(&web);
+                        send(&web, "error", format!("{error:#}"));
+                    }
+                }
+            }
+            Event::UserEvent(Message::RulesChecked { path, result }) => {
+                app.settings_busy = false;
+                match result {
+                    Ok(()) => {
+                        let updated = Settings {
+                            rules: Some(path),
+                            ..app.settings.clone()
+                        };
+                        if let Err(error) = app.save_settings(updated, &web) {
+                            send(&web, "error", format!("{error:#}"));
+                        }
+                    }
+                    Err(error) => send(&web, "error", format!("{error:#}")),
                 }
             }
             Event::UserEvent(Message::Quarantined(result)) => {
                 app.vault_busy = false;
                 send(&web, "vault_busy", false);
                 match result {
-                    Ok(item) => send(&web, "quarantined", item),
+                    Ok(item) => {
+                        send(&web, "quarantined", item);
+                        app.load_vault_async();
+                    }
                     Err(error) => send(&web, "error", format!("{error:#}")),
                 }
             }
@@ -576,10 +812,26 @@ fn run() -> Result<()> {
                     Err(error) => send(&web, "error", format!("{error:#}")),
                 }
             }
+            Event::UserEvent(Message::DeletedArchive(result)) => {
+                app.vault_busy = false;
+                send(&web, "vault_busy", false);
+                match result {
+                    Ok(item) => {
+                        send(
+                            &web,
+                            "notice",
+                            format!("Deleted archived copy of {}", item.original.display()),
+                        );
+                        app.load_vault_async();
+                    }
+                    Err(error) => send(&web, "error", format!("{error:#}")),
+                }
+            }
             Event::MainEventsCleared
                 if app.next_scan.is_some_and(|time| time <= Instant::now()) =>
             {
                 app.reset_schedule();
+                app.send_settings(&web);
                 if app.scan.is_none()
                     && !app.vault_busy
                     && let Err(error) = app.quick(true, &web)
